@@ -28,7 +28,7 @@ pub struct Http3Handler {
 impl Http3Handler {
     pub fn new(max_table_size: u32, max_blocked_streams: u16) -> Self {
         Http3Handler {
-            handler: Http3Connection::new(max_table_size, max_blocked_streams),
+            handler: Http3Connection::new(max_table_size, max_blocked_streams, 0),
         }
     }
     pub fn set_response(&mut self, stream_id: u64, headers: &[Header], data: Vec<u8>) -> Res<()> {

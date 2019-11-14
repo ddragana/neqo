@@ -37,8 +37,7 @@ impl Http3Client {
         cid_manager: Rc<RefCell<dyn ConnectionIdManager>>,
         local_addr: SocketAddr,
         remote_addr: SocketAddr,
-        max_table_size: u32,
-        max_blocked_streams: u16,
+        http3_parametars: (u32, u16, u64),
     ) -> Res<Http3Client> {
         Ok(Http3Client {
             conn: Connection::new_client(
@@ -48,7 +47,11 @@ impl Http3Client {
                 local_addr,
                 remote_addr,
             )?,
-            base_handler: Http3Connection::new(max_table_size, max_blocked_streams),
+            base_handler: Http3Connection::new(
+                http3_parametars.0,
+                http3_parametars.1,
+                http3_parametars.2,
+            ),
         })
     }
 
@@ -56,10 +59,15 @@ impl Http3Client {
         c: Connection,
         max_table_size: u32,
         max_blocked_streams: u16,
+        max_push_streams: u64,
     ) -> Res<Http3Client> {
         Ok(Http3Client {
             conn: c,
-            base_handler: Http3Connection::new(max_table_size, max_blocked_streams),
+            base_handler: Http3Connection::new(
+                max_table_size,
+                max_blocked_streams,
+                max_push_streams,
+            ),
         })
     }
 
@@ -280,8 +288,7 @@ mod tests {
             Rc::new(RefCell::new(FixedConnectionIdManager::new(3))),
             loopback(),
             loopback(),
-            100,
-            100,
+            (100, 100, 5),
         )
         .expect("create a default client")
     }
@@ -531,21 +538,6 @@ mod tests {
         }
         assert!(stop_sending_event_found);
         assert_eq!(hconn.state(), Http3State::Connected);
-    }
-
-    // Client: receive a push stream
-    #[test]
-    fn test_client_received_push_stream() {
-        let (mut hconn, mut peer_conn) = connect();
-
-        // create a push stream.
-        let push_stream_id = peer_conn.conn.stream_create(StreamType::UniDi).unwrap();
-        let _ = peer_conn.conn.stream_send(push_stream_id, &[0x1]);
-        let out = peer_conn.conn.process(None, now());
-        let out = hconn.process(out.dgram(), now());
-        peer_conn.conn.process(out.dgram(), now());
-
-        assert_closed(&hconn, Error::HttpIdError);
     }
 
     // Test wrong frame on req/rec stream
@@ -1488,7 +1480,7 @@ mod tests {
 
         let out = peer_conn.conn.process(None, now());
         hconn.process(out.dgram(), now());
-        // At this moment we have some new events, i.e. a HeadersReady event
+        // At this moment we have some new events, i.e. a HeaderReady event
 
         // Send a stop sending and reset.
         assert_eq!(
@@ -1571,7 +1563,7 @@ mod tests {
 
         let out = peer_conn.conn.process(None, now());
         hconn.process(out.dgram(), now());
-        // At this moment we have some new event, i.e. a HeadersReady event
+        // At this moment we have some new event, i.e. a HeaderReady event
 
         // Send a stop sending.
         assert_eq!(
@@ -2001,8 +1993,8 @@ mod tests {
         );
     }
 
-    // Send headers anf an empy data frame and a close stream.
-    // We should only recv HeadersReady event
+    // Send headers and an empy data frame and a close stream.
+    // We should only recv HeaderReady event
     #[test]
     fn test_stream_fin_after_headers_and_a_empty_data_frame() {
         let (mut hconn, mut peer_conn, request_stream_id) = connect_and_send_request();
@@ -2363,5 +2355,311 @@ mod tests {
             }
         }
         assert!(recv_header && recv_data);
+    }
+
+    const PUSH_PROMISE_DATA: &[u8] = &[
+        0x00, 0x00, 0xd1, 0xd7, 0x50, 0x89, 0x41, 0xe9, 0x2a, 0x67, 0x35, 0x53, 0x2e, 0x43, 0xd3,
+        0xc1,
+    ];
+    const PUSH_DATA: &[u8] = &[
+        // headers
+        0x01, 0x06, 0x00, 0x00, 0xd9, 0x54, 0x01, 0x33, // the data frame.
+        0x0, 0x3, 0x61, 0x62, 0x63,
+    ];
+
+    const RESPONSE_DATA: &[u8] = &[
+        0x01, 0x06, 0x00, 0x00, 0xd9, 0x54, 0x01, 0x36, // the data frame is incomplete.
+        0x0, 0x6, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66,
+    ];
+
+    // Send a push promise. (this function can only handle small push_id numbers that fit
+    // in a varint of length 1 byte)
+    fn send_push_promise(conn: &mut Connection, stream_id: u64, push_id: u8) {
+        let _ = conn.stream_send(stream_id, &[0x5, 0x11, push_id]).unwrap();
+        let _ = conn.stream_send(stream_id, &PUSH_PROMISE_DATA).unwrap();
+    }
+
+    fn send_push_data(conn: &mut Connection, stream_id: u64, push_id: u8) {
+        let _ = conn.stream_send(stream_id, &[0x01, push_id]).unwrap();
+        let _ = conn.stream_send(stream_id, PUSH_DATA).unwrap();
+    }
+
+    fn check_conn_events_with_push(
+        client: &mut Http3Client,
+        pushes: &[(u64, u64, u64)],
+        request_stream_id: u64,
+    ) {
+        while let Some(e) = client.next_event() {
+            match e {
+                Http3ClientEvent::Push {
+                    push_id,
+                    ref_stream_id,
+                    headers,
+                } => {
+                    assert!(pushes
+                        .iter()
+                        .any(|(p, r, _)| p == &push_id && r == &ref_stream_id));
+                    assert_eq!(&headers[..], PUSH_PROMISE_DATA);
+                }
+                Http3ClientEvent::PushHeaderReady { push_id, stream_id } => {
+                    assert!(pushes
+                        .iter()
+                        .any(|(p, _, s)| p == &push_id && s == &stream_id));
+                    let h = client.read_response_headers(stream_id);
+                    assert_eq!(
+                        h,
+                        Ok((
+                            vec![
+                                (String::from(":status"), String::from("200")),
+                                (String::from("content-length"), String::from("3"))
+                            ],
+                            false
+                        ))
+                    );
+                }
+                Http3ClientEvent::PushDataReadable { push_id, stream_id } => {
+                    assert!(pushes
+                        .iter()
+                        .any(|(p, _, s)| p == &push_id && s == &stream_id));
+                    let mut buf = [0u8; 100];
+                    let (amount, fin) = client
+                        .read_response_data(now(), stream_id, &mut buf)
+                        .unwrap();
+                    assert_eq!(fin, false);
+                    assert_eq!(amount, 3);
+                    assert_eq!(buf[..3], PUSH_DATA[10..]);
+                }
+                Http3ClientEvent::HeaderReady { stream_id } => {
+                    assert_eq!(stream_id, request_stream_id);
+                    let h = client.read_response_headers(stream_id);
+                    assert_eq!(
+                        h,
+                        Ok((
+                            vec![
+                                (String::from(":status"), String::from("200")),
+                                (String::from("content-length"), String::from("6"))
+                            ],
+                            false
+                        ))
+                    );
+                }
+                Http3ClientEvent::DataReadable { stream_id } => {
+                    assert_eq!(stream_id, request_stream_id);
+                    let mut buf = [0u8; 100];
+                    let (amount, fin) = client
+                        .read_response_data(now(), stream_id, &mut buf)
+                        .unwrap();
+                    if amount == 0 {
+                    assert_eq!(fin, true);
+                    } else {
+                    assert_eq!(amount, 6);
+                    assert_eq!(buf[..6], RESPONSE_DATA[10..]);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Client: receive a push stream
+    #[test]
+    fn test_client_received_push_stream() {
+        // Connect and send a request
+        let (mut client, mut peer_conn, request_stream_id) = connect_and_send_request();
+
+        // Send a push promise.
+        send_push_promise(&mut peer_conn.conn, request_stream_id, 0);
+
+        // create a push stream.
+        let push_stream_id = peer_conn.conn.stream_create(StreamType::UniDi).unwrap();
+        send_push_data(&mut peer_conn.conn, push_stream_id, 0);
+
+        let _ = peer_conn.conn.stream_send(request_stream_id, RESPONSE_DATA);
+        peer_conn.conn.stream_close_send(request_stream_id).unwrap();
+        let out = peer_conn.conn.process(None, now());
+        let out = client.process(out.dgram(), now());
+        peer_conn.conn.process(out.dgram(), now());
+
+        check_conn_events_with_push(
+            &mut client,
+            &[(0, request_stream_id, push_stream_id)],
+            request_stream_id,
+        );
+
+        assert_eq!(client.state(), Http3State::Connected);
+    }
+
+    #[test]
+    fn test_client_received_multiple_push_streams() {
+        // Connect and send a request
+        let (mut client, mut peer_conn, request_stream_id) = connect_and_send_request();
+
+        // Send a push promise.
+        send_push_promise(&mut peer_conn.conn, request_stream_id, 0);
+        send_push_promise(&mut peer_conn.conn, request_stream_id, 1);
+
+        // create the first push stream.
+        let push_stream_id_0 = peer_conn.conn.stream_create(StreamType::UniDi).unwrap();
+        send_push_data(&mut peer_conn.conn, push_stream_id_0, 0);
+
+        // create the second push stream.
+        let push_stream_id_1 = peer_conn.conn.stream_create(StreamType::UniDi).unwrap();
+        send_push_data(&mut peer_conn.conn, push_stream_id_1, 1);
+
+        let _ = peer_conn.conn.stream_send(request_stream_id, RESPONSE_DATA);
+        peer_conn.conn.stream_close_send(request_stream_id).unwrap();
+        let out = peer_conn.conn.process(None, now());
+        let out = client.process(out.dgram(), now());
+        peer_conn.conn.process(out.dgram(), now());
+
+        check_conn_events_with_push(
+            &mut client,
+            &[
+                (0, request_stream_id, push_stream_id_0),
+                (1, request_stream_id, push_stream_id_1),
+            ],
+            request_stream_id,
+        );
+
+        assert_eq!(client.state(), Http3State::Connected);
+    }
+
+    #[test]
+    fn test_client_push_after_stream_headers() {
+        // Connect and send a request
+        let (mut client, mut peer_conn, request_stream_id) = connect_and_send_request();
+
+        // Send response headers
+        let _ = peer_conn
+            .conn
+            .stream_send(request_stream_id, &RESPONSE_DATA[..8]);
+
+        // Send a push promise.
+        send_push_promise(&mut peer_conn.conn, request_stream_id, 0);
+
+        // create a push stream.
+        let push_stream_id = peer_conn.conn.stream_create(StreamType::UniDi).unwrap();
+        send_push_data(&mut peer_conn.conn, push_stream_id, 0);
+
+        // Send response data
+        let _ = peer_conn
+            .conn
+            .stream_send(request_stream_id, &RESPONSE_DATA[8..]);
+        peer_conn.conn.stream_close_send(request_stream_id).unwrap();
+        let out = peer_conn.conn.process(None, now());
+        let out = client.process(out.dgram(), now());
+        peer_conn.conn.process(out.dgram(), now());
+
+        check_conn_events_with_push(
+            &mut client,
+            &[(0, request_stream_id, push_stream_id)],
+            request_stream_id,
+        );
+
+        assert_eq!(client.state(), Http3State::Connected);
+    }
+
+    #[test]
+    fn test_client_push_after_a_stream_data_frame() {
+        // Connect and send a request
+        let (mut client, mut peer_conn, request_stream_id) = connect_and_send_request();
+
+        // Send response headers
+        let _ = peer_conn
+            .conn
+            .stream_send(request_stream_id, &RESPONSE_DATA[..8]);
+        // Send response data
+        let _ = peer_conn
+            .conn
+            .stream_send(request_stream_id, &RESPONSE_DATA[8..]);
+
+        // Send a push promise.
+        send_push_promise(&mut peer_conn.conn, request_stream_id, 0);
+        // create a push stream.
+        let push_stream_id = peer_conn.conn.stream_create(StreamType::UniDi).unwrap();
+        send_push_data(&mut peer_conn.conn, push_stream_id, 0);
+
+        // Close the request/response stream
+        peer_conn.conn.stream_close_send(request_stream_id).unwrap();
+
+        let out = peer_conn.conn.process(None, now());
+        let out = client.process(out.dgram(), now());
+        peer_conn.conn.process(out.dgram(), now());
+
+        check_conn_events_with_push(
+            &mut client,
+            &[(0, request_stream_id, push_stream_id)],
+            request_stream_id,
+        );
+
+        assert_eq!(client.state(), Http3State::Connected);
+    }
+
+    #[test]
+    fn test_client_receive_push_stream_before_promise() {
+        // Connect and send a request
+        let (mut client, mut peer_conn, request_stream_id) = connect_and_send_request();
+
+        // create a push stream.
+        let push_stream_id = peer_conn.conn.stream_create(StreamType::UniDi).unwrap();
+        send_push_data(&mut peer_conn.conn, push_stream_id, 0);
+
+        let out = peer_conn.conn.process(None, now());
+        let out = client.process(out.dgram(), now());
+        peer_conn.conn.process(out.dgram(), now());
+
+        let any_push_event = |e| matches!(e, Http3ClientEvent::Push{..} |Http3ClientEvent::PushHeaderReady{..} | Http3ClientEvent::PushDataReadable{..});
+        assert!(!client.events().any(any_push_event));
+
+        // Now send push_promise
+        send_push_promise(&mut peer_conn.conn, request_stream_id, 0);
+
+        // Send response data
+        let _ = peer_conn
+            .conn
+            .stream_send(request_stream_id, RESPONSE_DATA);
+        peer_conn.conn.stream_close_send(request_stream_id).unwrap();
+        let out = peer_conn.conn.process(None, now());
+        let out = client.process(out.dgram(), now());
+        peer_conn.conn.process(out.dgram(), now());
+
+        check_conn_events_with_push(
+            &mut client,
+            &[(0, request_stream_id, push_stream_id)],
+            request_stream_id,
+        );
+
+        assert_eq!(client.state(), Http3State::Connected);
+    }
+
+    #[test]
+    fn test_client_send_push_promise_with_push_id_gt_max_push_id() {
+        // Connect and send a request
+        let (mut client, mut peer_conn, request_stream_id) = connect_and_send_request();
+
+        // Send a push promise. max_push_id is set to 5, to trigger an error we send push_id=6.
+        send_push_promise(&mut peer_conn.conn, request_stream_id, 6);
+
+        let out = peer_conn.conn.process(None, now());
+        let out = client.process(out.dgram(), now());
+        peer_conn.conn.process(out.dgram(), now());
+
+        assert_closed(&client, Error::HttpIdError);
+    }
+
+    #[test]
+    fn test_client_create_push_stream_with_push_id_gt_max_push_id() {
+        // Connect and send a request
+        let (mut client, mut peer_conn) = connect();
+
+        // Send a push stream. max_push_id is set to 5, to trigger an error we send push_id=6.
+        let push_stream_id = peer_conn.conn.stream_create(StreamType::UniDi).unwrap();
+        send_push_data(&mut peer_conn.conn, push_stream_id, 6);
+
+        let out = peer_conn.conn.process(None, now());
+        let out = client.process(out.dgram(), now());
+        peer_conn.conn.process(out.dgram(), now());
+
+        assert_closed(&client, Error::HttpIdError);
     }
 }

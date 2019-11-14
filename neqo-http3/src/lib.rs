@@ -12,6 +12,7 @@ pub mod connection_client;
 mod control_stream_local;
 mod control_stream_remote;
 pub mod hframe;
+mod response_stream;
 pub mod server;
 mod server_connection_events;
 mod server_events;

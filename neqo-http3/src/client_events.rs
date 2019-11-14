@@ -14,7 +14,7 @@ use std::rc::Rc;
 
 #[derive(Debug, PartialOrd, Ord, PartialEq, Eq, Clone)]
 pub enum Http3ClientEvent {
-    /// Space available in the buffer for an application write to succeed.
+    /// Headers available for reading
     HeaderReady { stream_id: u64 },
     /// A stream can accept new data.
     DataWritable { stream_id: u64 },
@@ -24,8 +24,16 @@ pub enum Http3ClientEvent {
     Reset { stream_id: u64, error: AppError },
     /// Peer has send STOP_SENDING with error code EarlyResponse, other error will post a reset event.
     StopSending { stream_id: u64, error: AppError },
-    ///A new push stream
-    NewPushStream { stream_id: u64 },
+    ///A new push promise and assotiated headers
+    Push {
+        push_id: u64,
+        ref_stream_id: u64,
+        headers: Vec<u8>,
+    },
+    /// Header on a pushed stream are ready to be read
+    PushHeaderReady { push_id: u64, stream_id: u64 },
+    /// New bytes available on a push stream for reading.
+    PushDataReadable { push_id: u64, stream_id: u64 },
     /// New stream can be created
     RequestsCreatable,
     /// Cert authentication needed
@@ -63,10 +71,21 @@ impl Http3ClientEvents {
         self.insert(Http3ClientEvent::StopSending { stream_id, error });
     }
 
-    // TODO: implement push.
-    // pub fn new_push_stream(&self, stream_id: u64) {
-    //     self.insert(Http3ClientEvent::NewPushStream { stream_id });
-    // }
+    pub fn push(&self, push_id: u64, ref_stream_id: u64, headers: Vec<u8>) {
+        self.insert(Http3ClientEvent::Push {
+            push_id,
+            ref_stream_id,
+            headers,
+        });
+    }
+
+    pub fn push_header_ready(&self, push_id: u64, stream_id: u64) {
+        self.insert(Http3ClientEvent::PushHeaderReady { push_id, stream_id });
+    }
+
+    pub fn push_data_readable(&self, push_id: u64, stream_id: u64) {
+        self.insert(Http3ClientEvent::PushDataReadable { push_id, stream_id });
+    }
 
     pub fn new_requests_creatable(&self, stream_type: StreamType) {
         if stream_type == StreamType::BiDi {
@@ -123,7 +142,7 @@ impl Http3Events for Http3ClientEvents {
                 Http3ClientEvent::HeaderReady { stream_id: x }
                 | Http3ClientEvent::DataWritable { stream_id: x }
                 | Http3ClientEvent::DataReadable { stream_id: x }
-                | Http3ClientEvent::NewPushStream { stream_id: x }
+                | Http3ClientEvent::Push { ref_stream_id: x, .. }
                 | Http3ClientEvent::Reset { stream_id: x, .. }
                 | Http3ClientEvent::StopSending { stream_id: x, .. } if *x == stream_id)
         });
