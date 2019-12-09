@@ -1997,6 +1997,7 @@ impl ::std::fmt::Display for Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use neqo_common::matches;
     use crate::frame::StreamType;
     use std::mem;
     use test_fixture::{self, assertions, fixture_init, loopback, now};

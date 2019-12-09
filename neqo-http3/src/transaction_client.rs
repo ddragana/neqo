@@ -59,13 +59,12 @@ impl Request {
         }
 
         qinfo!([self], "Encoding headers for {}/{}", self.host, self.path);
-        let encoded_headers = encoder.encode_header_block(&self.headers, stream_id);
+        let header_block = encoder.encode_header_block(&self.headers, stream_id);
         let f = HFrame::Headers {
-            len: encoded_headers.len() as u64,
+            header_block: header_block.to_vec(),
         };
         let mut d = Encoder::default();
         f.encode(&mut d);
-        d.encode(&encoded_headers[..]);
         self.buf = Some(d.into());
     }
 
