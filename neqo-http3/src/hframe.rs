@@ -45,14 +45,14 @@ pub enum HSettingType {
     UnknownType,
 }
 
-// data for DATA and header blocks for HEADERS anf PUSH_PROMISE are not read into HFrame.
+// data for DATA is not read into HFrame.
 #[derive(PartialEq, Debug)]
 pub enum HFrame {
     Data {
         len: u64, // length of the data
     },
     Headers {
-        len: u64, // length of the header block
+        header_block: Vec<u8>,
     },
     CancelPush {
         push_id: u64,
@@ -93,9 +93,12 @@ impl HFrame {
         enc.encode_varint(self.get_type());
 
         match self {
-            HFrame::Data { len } | HFrame::Headers { len } => {
-                // DATA and HEADERS frames only encode the length here.
+            HFrame::Data { len } => {
+                // DATA frame only encode the length here.
                 enc.encode_varint(*len);
+            }
+            HFrame::Headers { header_block } => {
+                enc.encode_vvec(header_block);
             }
             HFrame::CancelPush { push_id } => {
                 enc.encode_vvec_with(|enc_inner| {
@@ -266,10 +269,8 @@ impl HFrameReader {
                             );
                             self.hframe_len = len;
                             self.state = match self.hframe_type {
-                                // DATA and HEADERS payload are left on the quic stream and picked up separately
-                                H3_FRAME_TYPE_DATA | H3_FRAME_TYPE_HEADERS => {
-                                    HFrameReaderState::Done
-                                }
+                                // DATA payload are left on the quic stream and picked up separately
+                                H3_FRAME_TYPE_DATA => HFrameReaderState::Done,
 
                                 // for other frames get all data before decoding.
                                 H3_FRAME_TYPE_CANCEL_PUSH
@@ -277,7 +278,8 @@ impl HFrameReader {
                                 | H3_FRAME_TYPE_GOAWAY
                                 | H3_FRAME_TYPE_MAX_PUSH_ID
                                 | H3_FRAME_TYPE_DUPLICATE_PUSH
-                                | H3_FRAME_TYPE_PUSH_PROMISE => {
+                                | H3_FRAME_TYPE_PUSH_PROMISE
+                                | H3_FRAME_TYPE_HEADERS => {
                                     if len == 0 {
                                         HFrameReaderState::Done
                                     } else {
@@ -360,7 +362,7 @@ impl HFrameReader {
                 len: self.hframe_len,
             },
             H3_FRAME_TYPE_HEADERS => HFrame::Headers {
-                len: self.hframe_len,
+                header_block: dec.decode_remainder().to_vec(),
             },
             H3_FRAME_TYPE_CANCEL_PUSH => HFrame::CancelPush {
                 push_id: match dec.decode_varint() {
@@ -496,8 +498,10 @@ mod tests {
 
     #[test]
     fn test_headers_frame() {
-        let f = HFrame::Headers { len: 3 };
-        enc_dec(&f, "0103010203", 3);
+        let f = HFrame::Headers {
+            header_block: vec![0x01, 0x02, 0x03],
+        };
+        enc_dec(&f, "0103010203", 0);
     }
 
     #[test]
@@ -541,10 +545,10 @@ mod tests {
         enc_dec(&f, "0e0105", 0);
     }
 
-    // We have 3 code paths in frame_reader:
-    // 1) All frames except DATA, HEADERES and PUSH_PROMISE (here we test SETTING and SETTINGS with larger varints)
-    // 2) PUSH_PROMISE and
-    // 1) DATA and HEADERS frame (for this we will test DATA)
+    // We have 2 code paths in frame_reader:
+    // 1) All frames except DATA (here we test SETTING, SETTINGS with larger varints
+    //    and PUSH_PROMISE)
+    // 2) DATA
 
     // Test SETTINGS
     #[test]
@@ -965,6 +969,7 @@ mod tests {
     #[test]
     fn test_complete_and_incomplete_frames() {
         const FRAME_LEN: usize = 10;
+        const HEADER_BLOCK: &[u8] = &[0x01, 0x02, 0x03, 0x04];
 
         // H3_FRAME_TYPE_DATA len=0
         let f = HFrame::Data { len: 0 };
@@ -983,22 +988,23 @@ mod tests {
         buf.resize(FRAME_LEN + buf.len(), 0);
         test_complete_and_incomplete_frame(&buf, 2);
 
-        // H3_FRAME_TYPE_HEADERS len=0
-        let f = HFrame::Data { len: 0 };
-        let mut enc = Encoder::with_capacity(2);
+        // H3_FRAME_TYPE_HEADERS empty header block
+        let f = HFrame::Headers {
+            header_block: Vec::new(),
+        };
+        let mut enc = Encoder::default();
         f.encode(&mut enc);
         let buf: Vec<_> = enc.into();
         test_complete_and_incomplete_frame(&buf, 2);
 
-        // H3_FRAME_TYPE_HEADERS len=FRAME_LEN
+        // H3_FRAME_TYPE_HEADERS
         let f = HFrame::Headers {
-            len: FRAME_LEN as u64,
+            header_block: HEADER_BLOCK.to_vec(),
         };
-        let mut enc = Encoder::with_capacity(2);
+        let mut enc = Encoder::default();
         f.encode(&mut enc);
-        let mut buf: Vec<_> = enc.into();
-        buf.resize(FRAME_LEN + buf.len(), 0);
-        test_complete_and_incomplete_frame(&buf, 2);
+        let buf: Vec<_> = enc.into();
+        test_complete_and_incomplete_frame(&buf, buf.len());
 
         // H3_FRAME_TYPE_CANCEL_PUSH
         let f = HFrame::CancelPush { push_id: 5 };
@@ -1019,7 +1025,7 @@ mod tests {
         // H3_FRAME_TYPE_PUSH_PROMISE
         let f = HFrame::PushPromise {
             push_id: 4,
-            header_block: vec![0x01, 0x02, 0x03, 0x04],
+            header_block: HEADER_BLOCK.to_vec(),
         };
         let mut enc = Encoder::default();
         f.encode(&mut enc);

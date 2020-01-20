@@ -1528,7 +1528,7 @@ mod tests {
         test_wrong_frame_on_request_stream(&[0xd, 0x1, 0x5]);
     }
 
-    fn test_wrong_frame_on_push_stream(v: &[u8]) {
+    fn test_wrong_frame_on_push_stream(after_data: bool, v: &[u8]) {
         let (mut client, mut peer_conn, request_stream_id) = connect_and_send_request();
 
         // Send a push promise with push_id 0
@@ -1536,11 +1536,20 @@ mod tests {
         // Create push stream
         let push_stream_id = peer_conn.conn.stream_create(StreamType::UniDi).unwrap();
 
-        // Send push stream type byte, push_id and frame v.
+        // Send push stream type byte, push_id, maybe header frame and frame v.
         let _ = peer_conn
             .conn
             .stream_send(push_stream_id, &[0x01, 0x0])
             .unwrap();
+        if after_data {
+            let _ = peer_conn
+                .conn
+                .stream_send(
+                    push_stream_id,
+                    &[0x01, 0x06, 0x00, 0x00, 0xd9, 0x54, 0x01, 0x33],
+                )
+                .unwrap();
+        }
         let _ = peer_conn.conn.stream_send(push_stream_id, v).unwrap();
 
         let out = peer_conn.conn.process(None, now());
@@ -1552,32 +1561,38 @@ mod tests {
 
     #[test]
     fn test_cancel_push_frame_on_push_stream() {
-        test_wrong_frame_on_push_stream(&[0x3, 0x1, 0x5]);
+        test_wrong_frame_on_push_stream(false, &[0x3, 0x1, 0x5]);
+        test_wrong_frame_on_push_stream(true, &[0x3, 0x1, 0x5]);
     }
 
     #[test]
     fn test_settings_frame_on_push_stream() {
-        test_wrong_frame_on_push_stream(&[0x4, 0x4, 0x6, 0x4, 0x8, 0x4]);
+        test_wrong_frame_on_push_stream(false, &[0x4, 0x4, 0x6, 0x4, 0x8, 0x4]);
+        test_wrong_frame_on_push_stream(true, &[0x4, 0x4, 0x6, 0x4, 0x8, 0x4]);
     }
 
     #[test]
     fn test_push_promise_frame_on_push_stream() {
-        test_wrong_frame_on_push_stream(&[0x5, 0x2, 0x1, 0x2]);
+        test_wrong_frame_on_push_stream(false, &[0x5, 0x2, 0x1, 0x2]);
+        test_wrong_frame_on_push_stream(true, &[0x5, 0x2, 0x1, 0x2]);
     }
 
     #[test]
     fn test_goaway_frame_on_push_stream() {
-        test_wrong_frame_on_push_stream(&[0x7, 0x1, 0x5]);
+        test_wrong_frame_on_push_stream(false, &[0x7, 0x1, 0x5]);
+        test_wrong_frame_on_push_stream(true, &[0x7, 0x1, 0x5]);
     }
 
     #[test]
     fn test_max_push_id_frame_on_push_stream() {
-        test_wrong_frame_on_push_stream(&[0xd, 0x1, 0x5]);
+        test_wrong_frame_on_push_stream(false, &[0xd, 0x1, 0x5]);
+        test_wrong_frame_on_push_stream(true, &[0xd, 0x1, 0x5]);
     }
 
     #[test]
     fn test_duplicate_push_frame_on_push_stream() {
-        test_wrong_frame_on_push_stream(&[0xe, 0x2, 0x1, 0x2]);
+        test_wrong_frame_on_push_stream(false, &[0xe, 0x2, 0x1, 0x2]);
+        test_wrong_frame_on_push_stream(true, &[0xe, 0x2, 0x1, 0x2]);
     }
 
     // Test reading of a slowly streamed frame. bytes are received one by one
@@ -3294,11 +3309,10 @@ mod tests {
             .encoder
             .encode_header_block(&headers, request_stream_id);
         let hframe = HFrame::Headers {
-            len: encoded_headers.len() as u64,
+            header_block: encoded_headers.to_vec(),
         };
         let mut d = Encoder::default();
         hframe.encode(&mut d);
-        d.encode(&encoded_headers);
         let d_frame = HFrame::Data { len: 3 };
         d_frame.encode(&mut d);
         d.encode(&[0x61, 0x62, 0x63]);
@@ -3341,6 +3355,72 @@ mod tests {
         assert!(recv_header && recv_data);
     }
 
+    #[test]
+    fn test_read_frames_header_blocked_with_fin_after_headers() {
+        let (mut hconn, mut peer_conn, request_stream_id) = connect_and_send_request();
+
+        peer_conn.encoder.set_max_capacity(100).unwrap();
+        peer_conn.encoder.set_max_blocked_streams(100).unwrap();
+
+        let headers = vec![
+            (String::from(":status"), String::from("200")),
+            (String::from("my-header"), String::from("my-header")),
+            (String::from("content-length"), String::from("0")),
+        ];
+        let encoded_headers = peer_conn
+            .encoder
+            .encode_header_block(&headers, request_stream_id);
+        let hframe = HFrame::Headers {
+            header_block: encoded_headers.to_vec(),
+        };
+        let mut d = Encoder::default();
+        hframe.encode(&mut d);
+
+        let _ = peer_conn.conn.stream_send(request_stream_id, &d[..]);
+        peer_conn.conn.stream_close_send(request_stream_id).unwrap();
+
+        // Send response before sending encoder instructions.
+        let out = peer_conn.conn.process(None, now());
+        let _out = hconn.process(out.dgram(), now());
+
+        let header_ready_event = |e| matches!(e, Http3ClientEvent::HeaderReady { .. });
+        assert!(!hconn.events().any(header_ready_event));
+
+        // Send encoder instructions to unblock the stream.
+        peer_conn.encoder.send(&mut peer_conn.conn).unwrap();
+
+        let out = peer_conn.conn.process(None, now());
+        let _out = hconn.process(out.dgram(), now());
+        let _out = hconn.process(None, now());
+
+        let mut recv_header = false;
+        // Now the stream is unblocked. After headers we will receive a fin..
+        while let Some(e) = hconn.next_event() {
+            match e {
+                Http3ClientEvent::HeaderReady { stream_id } => {
+                    assert_eq!(stream_id, request_stream_id);
+                    let h = hconn.read_response_headers(stream_id);
+                    assert_eq!(
+                        h,
+                        Ok((
+                            vec![
+                                (String::from(":status"), String::from("200")),
+                                (String::from("my-header"), String::from("my-header")),
+                                (String::from("content-length"), String::from("0"))
+                            ],
+                            true
+                        ))
+                    );
+                    recv_header = true;
+                }
+                x => {
+                    eprintln!("event {:?}", x);
+                    panic!()
+                }
+            }
+        }
+        assert!(recv_header);
+    }
     const PUSH_PROMISE_DATA: &[u8] = &[
         0x00, 0x00, 0xd1, 0xd7, 0x50, 0x89, 0x41, 0xe9, 0x2a, 0x67, 0x35, 0x53, 0x2e, 0x43, 0xd3,
         0xc1,
@@ -4679,6 +4759,61 @@ mod tests {
     }
 
     #[test]
+    fn test_client_duplicate_push_after_stream_headers() {
+        // Connect and send a request
+        let (mut client, mut peer_conn, request_stream_id) = connect_and_send_request();
+        // Make a second request
+        let request_stream_id_2 = send_request(&mut client, &mut peer_conn);
+
+        // Send response headers
+        let _ = peer_conn
+            .conn
+            .stream_send(request_stream_id_2, &RESPONSE_DATA[..8]);
+
+        // Send DUPLICATE_PUSH frame for push_id 0.
+        let _ = peer_conn
+            .conn
+            .stream_send(request_stream_id_2, DUP_PUSH_FRAME)
+            .unwrap();
+
+        // Send PUSH_PROMISE frame for push_id 0.
+        send_push_promise(&mut peer_conn.conn, request_stream_id, 0);
+
+        let out = peer_conn.conn.process(None, now());
+        let out = client.process(out.dgram(), now());
+        peer_conn.conn.process(out.dgram(), now());
+
+        // We should have Http3ClientEvent::Push and Http3ClientEvent::PushDuplicate.
+        let mut push = false;
+        let mut dup_push = false;
+        while let Some(e) = client.next_event() {
+            match e {
+                Http3ClientEvent::Push {
+                    push_id,
+                    ref_stream_id,
+                    headers,
+                } => {
+                    assert_eq!(push_id, 0);
+                    assert_eq!(ref_stream_id, request_stream_id);
+                    assert_eq!(&headers[..], PUSH_PROMISE_DATA);
+                    push = true;
+                }
+                Http3ClientEvent::PushDuplicate {
+                    push_id,
+                    ref_stream_id,
+                } => {
+                    assert_eq!(push_id, 0);
+                    assert_eq!(ref_stream_id, request_stream_id_2);
+                    dup_push = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(push);
+        assert!(dup_push);
+    }
+
+    #[test]
     fn test_duplicate_push_first_then_push_promise() {
         let (mut client, mut peer_conn, request_stream_id) = connect_and_send_request();
         // Make a second request
@@ -5813,7 +5948,7 @@ mod tests {
         send_push_data_and_send_packets(&mut client, &mut peer_conn, 4);
         assert_eq!(client.cancel_push(4), Ok(()));
 
-        // Make a new connection we do not have push_id available.
+        // Make a new connection.
         let (mut client, mut peer_conn, request_stream_id) = connect_and_send_request();
 
         // 8) In CancelPush state
@@ -5846,5 +5981,602 @@ mod tests {
         send_push_data_and_send_packets(&mut client, &mut peer_conn, 4);
         check_conn_events_with_push(&mut client, &[(4, request_stream_id)], request_stream_id);
         assert_eq!(client.cancel_push(4), Err(Error::InvalidStreamId));
+    }
+
+    #[test]
+    fn test_closing_stream_after_first_frame() {
+        // Make a new connection.
+        let (mut client, mut peer_conn, request_stream_id) = connect_and_send_request();
+        // Send PUSH_PROMISE frame for push_id 0.
+        send_push_promise(&mut peer_conn.conn, request_stream_id, 0);
+        peer_conn.conn.stream_close_send(request_stream_id).unwrap();
+
+        let out = peer_conn.conn.process(None, now());
+        let out = client.process(out.dgram(), now());
+        peer_conn.conn.process(out.dgram(), now());
+
+        assert_eq!(client.state(), Http3State::Connected);
+        let header_ready = |e| matches!(e, Http3ClientEvent::HeaderReady { .. });
+        assert!(client.events().any(header_ready));
+
+        // Make a new connection.
+        let (mut client, mut peer_conn, request_stream_id) = connect_and_send_request();
+
+        // Send DUPLICATE_PUSH frame for push_id 2.
+        let _ = peer_conn
+            .conn
+            .stream_send(request_stream_id, &[0xe, 0x1, 0x2])
+            .unwrap();
+
+        peer_conn.conn.stream_close_send(request_stream_id).unwrap();
+
+        let out = peer_conn.conn.process(None, now());
+        let out = client.process(out.dgram(), now());
+        peer_conn.conn.process(out.dgram(), now());
+
+        assert_eq!(client.state(), Http3State::Connected);
+        let header_ready = |e| matches!(e, Http3ClientEvent::HeaderReady { .. });
+        assert!(client.events().any(header_ready));
+    }
+
+    // Send fin after Push, but also Push is sent after Headers.
+    #[test]
+    fn test_headers_push_fin() {
+        // Make a new connection.
+        let (mut client, mut peer_conn, request_stream_id) = connect_and_send_request();
+
+        // Send HEADER frame.
+        let _ = peer_conn.conn.stream_send(
+            request_stream_id,
+            &[
+                // headers
+                0x01, 0x06, 0x00, 0x00, 0xd9, 0x54, 0x01, 0x30,
+            ],
+        );
+
+        let out = peer_conn.conn.process(None, now());
+        client.process(out.dgram(), now());
+
+        // Check response headers.
+        let mut response_headers = false;
+        while let Some(e) = client.next_event() {
+            match e {
+                Http3ClientEvent::HeaderReady { stream_id } => {
+                    assert_eq!(stream_id, request_stream_id);
+                    let h = client.read_response_headers(stream_id);
+                    assert_eq!(
+                        h,
+                        Ok((
+                            vec![
+                                (String::from(":status"), String::from("200")),
+                                (String::from("content-length"), String::from("0"))
+                            ],
+                            false
+                        ))
+                    );
+                    response_headers = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(response_headers);
+
+        // Send a Push_Promise frame
+        send_push_promise(&mut peer_conn.conn, request_stream_id, 0);
+        // Close stream
+        let _ = peer_conn.conn.stream_close_send(request_stream_id).unwrap();
+        let out = peer_conn.conn.process(None, now());
+        client.process(out.dgram(), now());
+
+        // Check that we have a Push and a DataReady event. Reading from the stream will return fin=true.
+        let mut data_ready = false;
+        let mut push = false;
+        while let Some(e) = client.next_event() {
+            match e {
+                Http3ClientEvent::HeaderReady { .. } => {
+                    panic!("We already had HeaderReady");
+                }
+                Http3ClientEvent::DataReadable { stream_id } => {
+                    assert_eq!(stream_id, request_stream_id);
+                    let mut buf = [0u8; 100];
+                    let res = client.read_response_data(now(), stream_id, &mut buf);
+                    let (len, fin) = res.expect("should read");
+                    assert_eq!(0, len);
+                    assert_eq!(fin, true);
+                    data_ready = true;
+                }
+                Http3ClientEvent::Push {
+                    push_id,
+                    ref_stream_id,
+                    headers,
+                } => {
+                    assert_eq!(push_id, 0);
+                    assert_eq!(ref_stream_id, request_stream_id);
+                    assert_eq!(&headers[..], PUSH_PROMISE_DATA);
+                    push = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(data_ready);
+        assert!(push);
+    }
+
+    // Send fin after DuplicaePush, but also DuplicatePush is sent after Headers.
+    #[test]
+    fn test_headers_duplicate_push_fin() {
+        // Make a new connection.
+        let (mut client, mut peer_conn, request_stream_id) = connect_and_send_request();
+
+        // Send HEADER frame.
+        let _ = peer_conn.conn.stream_send(
+            request_stream_id,
+            &[
+                // headers
+                0x01, 0x06, 0x00, 0x00, 0xd9, 0x54, 0x01, 0x30,
+            ],
+        );
+
+        let out = peer_conn.conn.process(None, now());
+        client.process(out.dgram(), now());
+
+        // Check response headers.
+        let mut response_headers = false;
+        while let Some(e) = client.next_event() {
+            match e {
+                Http3ClientEvent::HeaderReady { stream_id } => {
+                    assert_eq!(stream_id, request_stream_id);
+                    let h = client.read_response_headers(stream_id);
+                    assert_eq!(
+                        h,
+                        Ok((
+                            vec![
+                                (String::from(":status"), String::from("200")),
+                                (String::from("content-length"), String::from("0"))
+                            ],
+                            false
+                        ))
+                    );
+                    response_headers = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(response_headers);
+
+        // Send DUPLICATE_PUSH frame for push_id 0.
+        let _ = peer_conn
+            .conn
+            .stream_send(request_stream_id, &[0xe, 0x1, 0x0])
+            .unwrap();
+
+        peer_conn.conn.stream_close_send(request_stream_id).unwrap();
+
+        let out = peer_conn.conn.process(None, now());
+        let out = client.process(out.dgram(), now());
+        peer_conn.conn.process(out.dgram(), now());
+
+        // Make a second request
+        let request_stream_id_2 = send_request(&mut client, &mut peer_conn);
+        // Send PUSH_PROMISE frame for push_id 0.
+        send_push_promise(&mut peer_conn.conn, request_stream_id_2, 0);
+
+        let out = peer_conn.conn.process(None, now());
+        let out = client.process(out.dgram(), now());
+        peer_conn.conn.process(out.dgram(), now());
+
+        // Check that we have a Push and a DataReady event. Reading from the stream will return fin=true.
+        let mut data_ready = false;
+        let mut push = false;
+        let mut dup_push = false;
+        while let Some(e) = client.next_event() {
+            match e {
+                Http3ClientEvent::HeaderReady { .. } => {
+                    panic!("We already had HeaderReady");
+                }
+                Http3ClientEvent::DataReadable { stream_id } => {
+                    assert_eq!(stream_id, request_stream_id);
+                    let mut buf = [0u8; 100];
+                    let res = client.read_response_data(now(), stream_id, &mut buf);
+                    let (len, fin) = res.expect("should read");
+                    assert_eq!(0, len);
+                    assert_eq!(fin, true);
+                    data_ready = true;
+                }
+                Http3ClientEvent::Push {
+                    push_id,
+                    ref_stream_id,
+                    headers,
+                } => {
+                    assert_eq!(push_id, 0);
+                    assert_eq!(ref_stream_id, request_stream_id_2);
+                    assert_eq!(&headers[..], PUSH_PROMISE_DATA);
+                    push = true;
+                }
+                Http3ClientEvent::PushDuplicate {
+                    push_id,
+                    ref_stream_id,
+                } => {
+                    assert_eq!(push_id, 0);
+                    assert_eq!(ref_stream_id, request_stream_id);
+                    dup_push = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(data_ready);
+        assert!(push);
+        assert!(dup_push);
+    }
+
+    #[test]
+    fn test_trailers_with_fin_after_headers() {
+        // Make a new connection.
+        let (mut client, mut peer_conn, request_stream_id) = connect_and_send_request();
+
+        // Send HEADER frame.
+        let _ = peer_conn.conn.stream_send(
+            request_stream_id,
+            &[
+                // headers
+                0x01, 0x06, 0x00, 0x00, 0xd9, 0x54, 0x01, 0x30,
+            ],
+        );
+
+        let out = peer_conn.conn.process(None, now());
+        client.process(out.dgram(), now());
+
+        // Check response headers.
+        let mut response_headers = false;
+        while let Some(e) = client.next_event() {
+            match e {
+                Http3ClientEvent::HeaderReady { stream_id } => {
+                    assert_eq!(stream_id, request_stream_id);
+                    let h = client.read_response_headers(stream_id);
+                    assert_eq!(
+                        h,
+                        Ok((
+                            vec![
+                                (String::from(":status"), String::from("200")),
+                                (String::from("content-length"), String::from("0"))
+                            ],
+                            false
+                        ))
+                    );
+                    response_headers = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(response_headers);
+
+        // Send trailers
+        let _ = peer_conn.conn.stream_send(
+            request_stream_id,
+            &[
+                // headers
+                0x01, 0x06, 0x00, 0x00, 0xd9, 0x54, 0x01, 0x30,
+            ],
+        );
+        peer_conn.conn.stream_close_send(request_stream_id).unwrap();
+
+        let out = peer_conn.conn.process(None, now());
+        client.process(out.dgram(), now());
+
+        // Check that we have a DataReady event. Reading from the stream will return fin=true.
+        let mut data_ready = false;
+        while let Some(e) = client.next_event() {
+            match e {
+                Http3ClientEvent::HeaderReady { .. } => {
+                    panic!("We already had HeaderReady");
+                }
+                Http3ClientEvent::DataReadable { stream_id } => {
+                    assert_eq!(stream_id, request_stream_id);
+                    let mut buf = [0u8; 100];
+                    let res = client.read_response_data(now(), stream_id, &mut buf);
+                    let (len, fin) = res.expect("should read");
+                    assert_eq!(0, len);
+                    assert_eq!(fin, true);
+                    data_ready = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(data_ready);
+    }
+
+    #[test]
+    fn test_trailers_with_later_fin_after_headers() {
+        // Make a new connection.
+        let (mut client, mut peer_conn, request_stream_id) = connect_and_send_request();
+
+        // Send HEADER frame.
+        let _ = peer_conn.conn.stream_send(
+            request_stream_id,
+            &[
+                // headers
+                0x01, 0x06, 0x00, 0x00, 0xd9, 0x54, 0x01, 0x30,
+            ],
+        );
+
+        let out = peer_conn.conn.process(None, now());
+        client.process(out.dgram(), now());
+
+        // Check response headers.
+        let mut response_headers = false;
+        while let Some(e) = client.next_event() {
+            match e {
+                Http3ClientEvent::HeaderReady { stream_id } => {
+                    assert_eq!(stream_id, request_stream_id);
+                    let h = client.read_response_headers(stream_id);
+                    assert_eq!(
+                        h,
+                        Ok((
+                            vec![
+                                (String::from(":status"), String::from("200")),
+                                (String::from("content-length"), String::from("0"))
+                            ],
+                            false
+                        ))
+                    );
+                    response_headers = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(response_headers);
+
+        // Send trailers
+        let _ = peer_conn.conn.stream_send(
+            request_stream_id,
+            &[
+                // headers
+                0x01, 0x06, 0x00, 0x00, 0xd9, 0x54, 0x01, 0x30,
+            ],
+        );
+
+        let out = peer_conn.conn.process(None, now());
+        client.process(out.dgram(), now());
+
+        // Check that we do not have a DataReady event.
+        let data_readable = |e| matches!(e, Http3ClientEvent::DataReadable { .. });
+        assert!(!client.events().any(data_readable));
+
+        peer_conn.conn.stream_close_send(request_stream_id).unwrap();
+
+        let out = peer_conn.conn.process(None, now());
+        client.process(out.dgram(), now());
+
+        // Check that we have a DataReady event. Reading from the stream will return fin=true.
+        let mut data_ready = false;
+        while let Some(e) = client.next_event() {
+            match e {
+                Http3ClientEvent::HeaderReady { .. } => {
+                    panic!("We already had HeaderReady");
+                }
+                Http3ClientEvent::DataReadable { stream_id } => {
+                    assert_eq!(stream_id, request_stream_id);
+                    let mut buf = [0u8; 100];
+                    let res = client.read_response_data(now(), stream_id, &mut buf);
+                    let (len, fin) = res.expect("should read");
+                    assert_eq!(0, len);
+                    assert_eq!(fin, true);
+                    data_ready = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(data_ready);
+    }
+
+    #[test]
+    fn test_data_after_trailers_after_headers() {
+        // Make a new connection.
+        let (mut client, mut peer_conn, request_stream_id) = connect_and_send_request();
+
+        // Send HEADER frame.
+        let _ = peer_conn.conn.stream_send(
+            request_stream_id,
+            &[
+                // headers
+                0x01, 0x06, 0x00, 0x00, 0xd9, 0x54, 0x01, 0x30,
+            ],
+        );
+
+        let out = peer_conn.conn.process(None, now());
+        client.process(out.dgram(), now());
+
+        // Check response headers.
+        let mut response_headers = false;
+        while let Some(e) = client.next_event() {
+            match e {
+                Http3ClientEvent::HeaderReady { stream_id } => {
+                    assert_eq!(stream_id, request_stream_id);
+                    let h = client.read_response_headers(stream_id);
+                    assert_eq!(
+                        h,
+                        Ok((
+                            vec![
+                                (String::from(":status"), String::from("200")),
+                                (String::from("content-length"), String::from("0"))
+                            ],
+                            false
+                        ))
+                    );
+                    response_headers = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(response_headers);
+
+        // Send trailers
+        let _ = peer_conn.conn.stream_send(
+            request_stream_id,
+            &[
+                // headers
+                0x01, 0x06, 0x00, 0x00, 0xd9, 0x54, 0x01, 0x30,
+            ],
+        );
+
+        let out = peer_conn.conn.process(None, now());
+        client.process(out.dgram(), now());
+
+        // Check that we do not have a DataReady event.
+        let data_readable = |e| matches!(e, Http3ClientEvent::DataReadable { .. });
+        assert!(!client.events().any(data_readable));
+
+        // Send Data frame.
+        let _ = peer_conn.conn.stream_send(
+            request_stream_id,
+            &[
+                // data frame
+                0x0, 0x3, 0x61, 0x62, 0x63,
+            ],
+        );
+
+        let out = peer_conn.conn.process(None, now());
+        client.process(out.dgram(), now());
+        assert_closed(&client, Error::HttpFrameUnexpected);
+    }
+
+    #[test]
+    fn test_push_promise_after_trailers_after_headers() {
+        // Make a new connection.
+        let (mut client, mut peer_conn, request_stream_id) = connect_and_send_request();
+
+        // Send HEADER frame.
+        let _ = peer_conn.conn.stream_send(
+            request_stream_id,
+            &[
+                // headers
+                0x01, 0x06, 0x00, 0x00, 0xd9, 0x54, 0x01, 0x30,
+            ],
+        );
+
+        let out = peer_conn.conn.process(None, now());
+        client.process(out.dgram(), now());
+
+        // Check response headers.
+        let mut response_headers = false;
+        while let Some(e) = client.next_event() {
+            match e {
+                Http3ClientEvent::HeaderReady { stream_id } => {
+                    assert_eq!(stream_id, request_stream_id);
+                    let h = client.read_response_headers(stream_id);
+                    assert_eq!(
+                        h,
+                        Ok((
+                            vec![
+                                (String::from(":status"), String::from("200")),
+                                (String::from("content-length"), String::from("0"))
+                            ],
+                            false
+                        ))
+                    );
+                    response_headers = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(response_headers);
+
+        // Send trailers
+        let _ = peer_conn.conn.stream_send(
+            request_stream_id,
+            &[
+                // headers
+                0x01, 0x06, 0x00, 0x00, 0xd9, 0x54, 0x01, 0x30,
+            ],
+        );
+
+        let out = peer_conn.conn.process(None, now());
+        client.process(out.dgram(), now());
+
+        // Check that we do not have a DataReady event.
+        let data_readable = |e| matches!(e, Http3ClientEvent::DataReadable { .. });
+        assert!(!client.events().any(data_readable));
+
+        // Send PushPromise frame.
+        send_push_promise(&mut peer_conn.conn, request_stream_id, 0);
+
+        let out = peer_conn.conn.process(None, now());
+        client.process(out.dgram(), now());
+
+        // This should not cause an error.
+        assert_eq!(client.state(), Http3State::Connected);
+
+        // Check that we have a Push event.
+        let push = |e| matches!(e, Http3ClientEvent::Push { .. });
+        assert!(client.events().any(push));
+    }
+
+    #[test]
+    fn test_duplicate_push_after_trailers_after_headers() {
+        // Make a new connection.
+        let (mut client, mut peer_conn, request_stream_id) = connect_and_send_request();
+
+        // Send HEADER frame.
+        let _ = peer_conn.conn.stream_send(
+            request_stream_id,
+            &[
+                // headers
+                0x01, 0x06, 0x00, 0x00, 0xd9, 0x54, 0x01, 0x30,
+            ],
+        );
+
+        let out = peer_conn.conn.process(None, now());
+        client.process(out.dgram(), now());
+
+        // Check response headers.
+        let mut response_headers = false;
+        while let Some(e) = client.next_event() {
+            match e {
+                Http3ClientEvent::HeaderReady { stream_id } => {
+                    assert_eq!(stream_id, request_stream_id);
+                    let h = client.read_response_headers(stream_id);
+                    assert_eq!(
+                        h,
+                        Ok((
+                            vec![
+                                (String::from(":status"), String::from("200")),
+                                (String::from("content-length"), String::from("0"))
+                            ],
+                            false
+                        ))
+                    );
+                    response_headers = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(response_headers);
+
+        // Send trailers
+        let _ = peer_conn.conn.stream_send(
+            request_stream_id,
+            &[
+                // headers
+                0x01, 0x06, 0x00, 0x00, 0xd9, 0x54, 0x01, 0x30,
+            ],
+        );
+        let out = peer_conn.conn.process(None, now());
+        client.process(out.dgram(), now());
+
+        // Check that we do not have a DataReady event.
+        let data_readable = |e| matches!(e, Http3ClientEvent::DataReadable { .. });
+        assert!(!client.events().any(data_readable));
+
+        // Send DUPLICATE_PUSH frame for push_id 0.
+        let _ = peer_conn
+            .conn
+            .stream_send(request_stream_id, &[0xe, 0x1, 0x0])
+            .unwrap();
+
+        let out = peer_conn.conn.process(None, now());
+        client.process(out.dgram(), now());
+
+        // This should not cause an error.
+        assert_eq!(client.state(), Http3State::Connected);
     }
 }
