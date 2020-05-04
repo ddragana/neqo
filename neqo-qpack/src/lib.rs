@@ -29,18 +29,6 @@ mod table;
 pub type Header = (String, String);
 type Res<T> = Result<T, Error>;
 
-#[derive(Debug)]
-enum QPackSide {
-    Encoder,
-    Decoder,
-}
-
-impl ::std::fmt::Display for QPackSide {
-    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
-        write!(f, "{:?}", self)
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum Error {
     DecompressionFailed,
@@ -48,8 +36,11 @@ pub enum Error {
     DecoderStream,
     ClosedCriticalStream,
 
-    // These are internal errors, they will be transfromed into one of the above.
+    // These are internal errors, they will be transformed into one of the above or ignored.
     HeaderLookup,
+    ChangeCapacity,
+    DynamicTableFull,
+    IncrementAck,
     NoMoreData,
     IntegerOverflow,
     WrongStreamCount,

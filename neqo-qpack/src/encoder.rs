@@ -60,10 +60,16 @@ impl QPackEncoder {
     /// a `SETTINGS_QPACK_MAX_TABLE_CAPACITY` setting parameter.
     /// # Errors
     /// `EncoderStream` if value is too big.
+    /// `ChangeCapacity` if table capacity cannot be reduced.
     pub fn set_max_capacity(&mut self, cap: u64) -> Res<()> {
         if cap > (1 << 30) - 1 {
             return Err(Error::EncoderStream);
         }
+
+        if cap == self.table.capacity() {
+            return Ok(());
+        }
+
         qdebug!(
             [self],
             "Set max capacity to {} {}.",
@@ -124,7 +130,9 @@ impl QPackEncoder {
     }
 
     fn insert_count_instruction(&mut self, increment: u64) -> Res<()> {
-        self.table.increment_acked(increment)?;
+        self.table
+            .increment_acked(increment)
+            .map_err(|_| Error::DecoderStream)?;
         self.recalculate_blocked_streams();
         Ok(())
     }
@@ -203,6 +211,7 @@ impl QPackEncoder {
     /// The function can return transport errors.
     /// `HeaderLookup` if `InsertWithNameRefStatic`, `InsertWithNameRefDynamic` or `Duplicate` is used and the
     /// reference entry cannot be found.
+    /// `DynamicTableFull` if the dynamic table does not have enough space for the entry.
     pub fn insert(&mut self, conn: &mut Connection, instruction: &EncoderInstruction) -> Res<u64> {
         qdebug!([self], "insert instruction {:?}.", instruction);
         self.send(conn)?;
@@ -257,7 +266,9 @@ impl QPackEncoder {
         if self.send_buf.is_empty() {
             Ok(())
         } else if let Some(stream_id) = self.local_stream_id {
-            let r = conn.stream_send(stream_id, &self.send_buf[..]).map_err(|_| Error::EncoderStream)?;
+            let r = conn
+                .stream_send(stream_id, &self.send_buf[..])
+                .map_err(|_| Error::EncoderStream)?;
             qdebug!([self], "{} bytes sent.", r);
             self.send_buf.read(r as usize);
             Ok(())
@@ -344,6 +355,9 @@ impl QPackEncoder {
                         // As soon as one of the instructions cannot be written, do not try again.
                         encoder_stream_blocked = true;
                         encoded_h.encode_literal_with_name_literal(&name, &value)
+                    }
+                    Err(Error::DynamicTableFull) => {
+                        encoded_h.encode_literal_with_name_literal(&name, &value);
                     }
                     Err(e) => return Err(e),
                 }
@@ -545,7 +559,7 @@ mod tests {
                 },
             )
             .unwrap_err();
-        assert_eq!(Error::EncoderStream, e);
+        assert_eq!(Error::DynamicTableFull, e);
         send_instructions(&mut encoder, &[0x02]);
     }
 
@@ -583,7 +597,7 @@ mod tests {
                 value: VALUE_1,
             },
         );
-        assert_eq!(Error::EncoderStream, res.unwrap_err());
+        assert_eq!(Error::DynamicTableFull, res.unwrap_err());
         send_instructions(&mut encoder, &[0x02]);
     }
 
