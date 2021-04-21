@@ -139,6 +139,12 @@ pub struct Args {
     /// Use http 0.9 instead of HTTP/3
     use_old_http: bool,
 
+    #[structopt(name = "h-zerortt", short = "w", long)]
+    /// Try to use 0RTT by connecting to the same server 2 time:
+    /// 1) to get a token,
+    /// 2) used the token.
+    h_zerortt: bool,
+
     #[structopt(name = "download-in-series", long)]
     /// Download resources in series using separate connections.
     /// Only works with old HTTP (that is, `-o`).
@@ -274,15 +280,19 @@ fn process_loop(
     socket: &UdpSocket,
     client: &mut Http3Client,
     handler: &mut Handler,
-) -> Res<neqo_http3::Http3State> {
+) -> Res<(neqo_http3::Http3State, Option<ResumptionToken>)> {
+    let mut token = None;
     let buf = &mut [0u8; 2048];
     loop {
         if let Http3State::Closed(..) = client.state() {
-            return Ok(client.state());
+            return Ok((client.state(), token));
         }
 
-        let mut exiting = !handler.handle(client)?;
-
+        let (not_done, t) = handler.handle(client)?;
+        if let Some(tk) = t {
+            token = Some(tk);
+        }
+        let mut exiting = !not_done;
         loop {
             match client.process_output(Instant::now()) {
                 Output::Datagram(dgram) => {
@@ -307,7 +317,7 @@ fn process_loop(
         }
 
         if exiting {
-            return Ok(client.state());
+            return Ok((client.state(), token));
         }
 
         match socket.recv_from(&mut buf[..]) {
@@ -407,7 +417,8 @@ impl<'a> Handler<'a> {
         self.streams.is_empty() && self.url_queue.is_empty()
     }
 
-    fn handle(&mut self, client: &mut Http3Client) -> Res<bool> {
+    fn handle(&mut self, client: &mut Http3Client) -> Res<(bool, Option<ResumptionToken>)> {
+        let mut token = None;
         while let Some(event) = client.next_event() {
             match event {
                 Http3ClientEvent::AuthenticationNeeded => {
@@ -426,7 +437,7 @@ impl<'a> Handler<'a> {
                     }
                     None => {
                         println!("Data on unexpected stream: {}", stream_id);
-                        return Ok(false);
+                        return Ok((false, token));
                     }
                 },
                 Http3ClientEvent::DataReadable { stream_id } => {
@@ -434,7 +445,7 @@ impl<'a> Handler<'a> {
                     match self.streams.get_mut(&stream_id) {
                         None => {
                             println!("Data on unexpected stream: {}", stream_id);
-                            return Ok(false);
+                            return Ok((false, token));
                         }
                         Some(out_file) => loop {
                             let mut data = vec![0; 4096];
@@ -473,13 +484,17 @@ impl<'a> Handler<'a> {
                         self.download_urls(client);
                         if self.done() {
                             client.close(Instant::now(), 0, "kthxbye!");
-                            return Ok(false);
+                            return Ok((false, token));
                         }
                     }
                 }
                 Http3ClientEvent::StateChange(Http3State::Connected)
+                | Http3ClientEvent::StateChange(Http3State::ZeroRtt)
                 | Http3ClientEvent::RequestsCreatable => {
                     self.download_urls(client);
+                }
+                Http3ClientEvent::ResumptionToken(t) => {
+                    token = Some(t);
                 }
                 _ => {
                     println!("Unhandled event {:?}", event);
@@ -487,7 +502,7 @@ impl<'a> Handler<'a> {
             }
         }
 
-        Ok(true)
+        Ok((true, token))
     }
 }
 
@@ -513,7 +528,8 @@ fn client(
     remote_addr: SocketAddr,
     hostname: &str,
     urls: &[Url],
-) -> Res<()> {
+    token: Option<ResumptionToken>
+) -> Res<Option<ResumptionToken>> {
     let quic_protocol = match args.alpn.as_str() {
         "h3" => QuicVersion::Version1,
         "h3-27" => QuicVersion::Draft27,
@@ -550,6 +566,10 @@ fn client(
         },
     );
 
+    if let Some(t) = token {
+        client.enable_resumption(Instant::now(), t)?;
+    }
+
     let qlog = qlog_new(args, hostname, client.connection_id())?;
     client.set_qlog(qlog);
 
@@ -562,9 +582,9 @@ fn client(
         key_update,
     };
 
-    process_loop(&local_addr, &socket, &mut client, &mut h)?;
+    let (_, t) = process_loop(&local_addr, &socket, &mut client, &mut h)?;
 
-    Ok(())
+    Ok(t)
 }
 
 fn qlog_new(args: &Args, hostname: &str, cid: &ConnectionId) -> Res<NeqoQlog> {
@@ -654,6 +674,36 @@ fn main() -> Res<()> {
             SocketAddr::V6(..) => SocketAddr::new(IpAddr::V6(Ipv6Addr::from([0; 16])), 0),
         };
 
+        let token = if args.h_zerortt && !args.use_old_http {
+            let socket = match UdpSocket::bind(local_addr) {
+                Err(e) => {
+                    eprintln!("Unable to bind UDP socket: {}", e);
+                    exit(1)
+                }
+                Ok(s) => s,
+            };
+
+            let real_local = socket.local_addr().unwrap();
+            println!(
+                "{} Client connecting to get a token: {:?} -> {:?}",
+                if args.use_old_http { "H9" } else { "H3" },
+                real_local,
+                remote_addr,
+            );
+
+            client(
+                &args,
+                socket,
+                real_local,
+                remote_addr,
+                &format!("{}", host),
+                &urls[..1],
+                None,
+            )?
+        } else {
+            None
+        };
+
         let socket = match UdpSocket::bind(local_addr) {
             Err(e) => {
                 eprintln!("Unable to bind UDP socket: {}", e);
@@ -678,6 +728,7 @@ fn main() -> Res<()> {
                 remote_addr,
                 &format!("{}", host),
                 &urls,
+                token
             )?;
         } else if !args.download_in_series {
             let token = if args.resume {
