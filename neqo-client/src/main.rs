@@ -345,13 +345,14 @@ fn process_loop(
 struct Handler<'a> {
     streams: HashMap<u64, Option<File>>,
     url_queue: VecDeque<Url>,
+    url_zerortt: VecDeque<Url>,
     all_paths: Vec<PathBuf>,
     args: &'a Args,
     key_update: KeyUpdateState,
 }
 
 impl<'a> Handler<'a> {
-    fn download_urls(&mut self, client: &mut Http3Client) {
+    fn download_urls(&mut self, client: &mut Http3Client, zerortt: bool) {
         loop {
             if self.url_queue.is_empty() {
                 break;
@@ -359,13 +360,13 @@ impl<'a> Handler<'a> {
             if self.streams.len() >= self.args.concurrency {
                 break;
             }
-            if !self.download_next(client) {
+            if !self.download_next(client, zerortt) {
                 break;
             }
         }
     }
 
-    fn download_next(&mut self, client: &mut Http3Client) -> bool {
+    fn download_next(&mut self, client: &mut Http3Client, zerortt: bool) -> bool {
         if self.key_update.needed() {
             println!("Deferring requests until first key update");
             return false;
@@ -374,6 +375,9 @@ impl<'a> Handler<'a> {
             .url_queue
             .pop_front()
             .expect("download_next called with empty queue");
+        if zerortt {
+            self.url_zerortt.push_front(url.clone());
+        }
         match client.fetch(
             Instant::now(),
             &self.args.method,
@@ -407,9 +411,21 @@ impl<'a> Handler<'a> {
         }
     }
 
+    fn zerortt_rejected(&mut self) {
+        println!("Zero RTT has been rejected - clean up streams");
+        self.streams.clear();
+        loop {
+            if let Some(url) = self.url_zerortt.pop_front() {
+                self.url_queue.push_front(url);
+            } else {
+                break;
+            }
+        }
+    }
+
     fn maybe_key_update(&mut self, c: &mut Http3Client) -> Res<()> {
         self.key_update.maybe_update(|| c.initiate_key_update())?;
-        self.download_urls(c);
+        self.download_urls(c, false);
         Ok(())
     }
 
@@ -481,20 +497,25 @@ impl<'a> Handler<'a> {
 
                     if stream_done {
                         self.streams.remove(&stream_id);
-                        self.download_urls(client);
+                        self.download_urls(client, false);
                         if self.done() {
                             client.close(Instant::now(), 0, "kthxbye!");
                             return Ok((false, token));
                         }
                     }
                 }
+                Http3ClientEvent::StateChange(Http3State::ZeroRtt) => {
+                    self.download_urls(client, true);
+                }
                 Http3ClientEvent::StateChange(Http3State::Connected)
-                | Http3ClientEvent::StateChange(Http3State::ZeroRtt)
                 | Http3ClientEvent::RequestsCreatable => {
-                    self.download_urls(client);
+                    self.download_urls(client, false);
                 }
                 Http3ClientEvent::ResumptionToken(t) => {
                     token = Some(t);
+                }
+                Http3ClientEvent::ZeroRttRejected => {
+                    self.zerortt_rejected();
                 }
                 _ => {
                     println!("Unhandled event {:?}", event);
@@ -528,7 +549,7 @@ fn client(
     remote_addr: SocketAddr,
     hostname: &str,
     urls: &[Url],
-    token: Option<ResumptionToken>
+    token: Option<ResumptionToken>,
 ) -> Res<Option<ResumptionToken>> {
     let quic_protocol = match args.alpn.as_str() {
         "h3" => QuicVersion::Version1,
@@ -577,6 +598,7 @@ fn client(
     let mut h = Handler {
         streams: HashMap::new(),
         url_queue: VecDeque::from(urls.to_vec()),
+        url_zerortt: VecDeque::new(),
         all_paths: Vec::new(),
         args: &args,
         key_update,
@@ -691,15 +713,20 @@ fn main() -> Res<()> {
                 remote_addr,
             );
 
-            client(
+            let t = client(
                 &args,
                 socket,
                 real_local,
                 remote_addr,
                 &format!("{}", host),
-                &urls[..1],
+                &urls,
                 None,
-            )?
+            )?;
+            if t.is_none() {
+                println!("No token received.");
+                exit(1);
+            }
+            t
         } else {
             None
         };
@@ -728,7 +755,7 @@ fn main() -> Res<()> {
                 remote_addr,
                 &format!("{}", host),
                 &urls,
-                token
+                token,
             )?;
         } else if !args.download_in_series {
             let token = if args.resume {
