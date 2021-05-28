@@ -305,7 +305,12 @@ impl Http3Client {
 
         self.base_handler.add_streams(
             id,
-            SendMessage::new_with_headers(id, final_headers, Box::new(self.events.clone())),
+            Box::new(SendMessage::new_with_headers(
+                id,
+                final_headers,
+                self.base_handler.qpack_encoder.clone(),
+                Box::new(self.events.clone()),
+            )),
             Box::new(RecvMessage::new(
                 MessageType::Response,
                 id,
@@ -322,10 +327,7 @@ impl Http3Client {
             .send_streams
             .get_mut(&id)
             .ok_or(Error::InvalidStreamId)?
-            .send(
-                &mut self.conn,
-                &mut self.base_handler.qpack_encoder.borrow_mut(),
-            );
+            .send(&mut self.conn);
         if let Err(e) = output {
             if e.connection_error() {
                 self.close(now, e.code(), "");
