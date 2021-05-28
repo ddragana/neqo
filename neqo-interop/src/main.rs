@@ -518,6 +518,7 @@ fn connect_h3(nctx: &NetworkCtx, peer: &Peer, client: Connection) -> Result<H3Ha
                     max_blocked_streams: 10,
                 },
                 max_concurrent_push_streams: 10,
+                enable_wt: false,
             },
         ),
         host: String::from(peer.host),
@@ -612,6 +613,7 @@ fn test_h3_rz(
                 max_blocked_streams: 10,
             },
             max_concurrent_push_streams: 0,
+            enable_wt: false,
         },
         Instant::now(),
     );

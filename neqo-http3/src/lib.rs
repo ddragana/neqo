@@ -27,6 +27,7 @@ mod server_connection_events;
 mod server_events;
 mod settings;
 mod stream_type_reader;
+mod wt;
 
 use neqo_qpack::decoder::QPACK_UNI_STREAM_TYPE_DECODER;
 use neqo_qpack::encoder::QPACK_UNI_STREAM_TYPE_ENCODER;
