@@ -617,6 +617,12 @@ impl Http3Client {
                             .handle_cancel_push(push_id, &mut self.conn, &mut self.base_handler),
                         HFrame::MaxPushId { .. } => Err(Error::HttpFrameUnexpected),
                         HFrame::Goaway { stream_id } => self.handle_goaway(stream_id),
+                        HFrame::Settings { .. } => {
+                            self.events.web_transport_negotiation_done(
+                                self.base_handler.web_transport_enabled(),
+                            );
+                            Ok(())
+                        }
                         _ => {
                             unreachable!(
                                 "we should only put MaxPushId and Goaway into control_frames."
