@@ -13,8 +13,8 @@ use crate::qpack_decoder_receiver::DecoderRecvStream;
 use crate::qpack_encoder_receiver::EncoderRecvStream;
 use crate::settings::{HSetting, HSettingType, HSettings, HttpZeroRttChecker};
 use crate::stream_type_reader::NewStreamTypeReader;
-use crate::wt::WebTransportController;
-use crate::{Http3StreamType, ReceiveOutput, RecvStream, ResetType, SendStream};
+use crate::wt::{WebTransportController, WebTransportControllerState, WebTransportSession};
+use crate::{Http3StreamType, NewStreamType, ReceiveOutput, RecvStream, ResetType, SendStream};
 use neqo_common::{qdebug, qerror, qinfo, qtrace, qwarn};
 use neqo_qpack::decoder::QPackDecoder;
 use neqo_qpack::encoder::QPackEncoder;
@@ -68,7 +68,7 @@ pub(crate) struct Http3Connection {
     streams_have_data_to_send: BTreeSet<u64>,
     pub send_streams: HashMap<u64, Box<dyn SendStream>>,
     pub recv_streams: HashMap<u64, Box<dyn RecvStream>>,
-    web_transport: Option<WebTransportController>,
+    pub web_transport: Option<WebTransportController>,
 }
 
 impl ::std::fmt::Display for Http3Connection {
@@ -227,7 +227,7 @@ impl Http3Connection {
         }
     }
 
-    pub fn handle_new_unidi_stream(&mut self, stream_id: u64) {
+    pub fn add_new_stream(&mut self, stream_id: u64) {
         qtrace!([self], "A new stream: {}.", stream_id);
         self.recv_streams
             .insert(stream_id, Box::new(NewStreamTypeReader::new(stream_id)));
@@ -259,7 +259,6 @@ impl Http3Connection {
         stream_id: u64,
     ) -> Res<ReceiveOutput> {
         let mut output = self.stream_receive(conn, stream_id)?;
-
         if let ReceiveOutput::NewStream(stream_type) = output {
             output = self.handle_new_stream(conn, stream_type, stream_id)?;
         }
@@ -285,6 +284,8 @@ impl Http3Connection {
                 }
                 Ok(ReceiveOutput::ControlFrames(rest))
             }
+            ReceiveOutput::NewStream(NewStreamType::Push)
+            | ReceiveOutput::NewStream(NewStreamType::Http) => Ok(output),
             ReceiveOutput::NewStream(_) => {
                 unreachable!("NewStream should have been handled already")
             }
@@ -414,48 +415,94 @@ impl Http3Connection {
     fn handle_new_stream(
         &mut self,
         conn: &mut Connection,
-        stream_type: Http3StreamType,
+        stream_type: NewStreamType,
         stream_id: u64,
     ) -> Res<ReceiveOutput> {
-        let recv_stream: Option<Box<dyn RecvStream>> = match stream_type {
-            Http3StreamType::Control => {
+        match stream_type {
+            NewStreamType::Control => {
                 self.check_stream_exists(&Http3StreamType::Control)?;
-                Some(Box::new(ControlStreamRemote::new(stream_id)))
+                self.recv_streams
+                    .insert(stream_id, Box::new(ControlStreamRemote::new(stream_id)));
             }
 
-            Http3StreamType::Push => {
+            NewStreamType::Push => {
                 qinfo!([self], "A new push stream {}.", stream_id);
-                None
             }
-            Http3StreamType::Decoder => {
+            NewStreamType::Http => {
+                qinfo!([self], "A new http stream {}.", stream_id);
+            }
+            NewStreamType::Decoder => {
                 qinfo!([self], "A new remote qpack encoder stream {}", stream_id);
                 self.check_stream_exists(&Http3StreamType::Decoder)?;
-                Some(Box::new(DecoderRecvStream::new(
+                self.recv_streams.insert(
                     stream_id,
-                    Rc::clone(&self.qpack_decoder),
-                )))
+                    Box::new(DecoderRecvStream::new(
+                        stream_id,
+                        Rc::clone(&self.qpack_decoder),
+                    )),
+                );
             }
-            Http3StreamType::Encoder => {
+            NewStreamType::Encoder => {
                 qinfo!([self], "A new remote qpack decoder stream {}", stream_id);
                 self.check_stream_exists(&Http3StreamType::Encoder)?;
-                Some(Box::new(EncoderRecvStream::new(
+                self.recv_streams.insert(
                     stream_id,
-                    Rc::clone(&self.qpack_encoder),
-                )))
+                    Box::new(EncoderRecvStream::new(
+                        stream_id,
+                        Rc::clone(&self.qpack_encoder),
+                    )),
+                );
+            }
+            NewStreamType::WebTransportStream(session_id) => {
+                qinfo!(
+                    [self],
+                    "A new remote WebTransport stream session={} wt-state={:?}",
+                    session_id,
+                    self.web_transport
+                );
+                match self
+                    .web_transport
+                    .as_ref()
+                    .map_or(WebTransportControllerState::NegotiationFailed, |w| {
+                        w.state()
+                    }) {
+                    WebTransportControllerState::Negotiated => {
+                        if let Some(s) = self.send_streams.get_mut(&session_id) {
+                            if let Some(wt) = s.get_wt_session() {
+                                match WebTransportSession::create_new_stream_remote(wt, stream_id) {
+                                    (r, Some(s)) => self.add_streams(stream_id, s, r),
+                                    (r, None) => {
+                                        self.recv_streams.insert(stream_id, r);
+                                    }
+                                }
+                            } else {
+                                return Err(Error::HttpGeneralProtocol);
+                            }
+                        } else {
+                            conn.stream_stop_sending(stream_id, Error::HttpRequestRejected.code())?;
+                        }
+                    }
+                    WebTransportControllerState::Negoiating => {
+                        conn.stream_stop_sending(stream_id, Error::HttpRequestRejected.code())?;
+                    }
+                    WebTransportControllerState::NegotiationFailed => {
+                        conn.stream_stop_sending(stream_id, Error::HttpStreamCreation.code())?;
+                    }
+                }
             }
             _ => {
                 conn.stream_stop_sending(stream_id, Error::HttpStreamCreation.code())?;
-                None
             }
         };
 
-        match (recv_stream, stream_type) {
-            (Some(rs), _) => {
-                self.recv_streams.insert(stream_id, rs);
-                self.stream_receive(conn, stream_id)
-            }
-            (None, Http3StreamType::Push) => Ok(ReceiveOutput::PushStream),
-            (None, _) => Ok(ReceiveOutput::NoOutput),
+        match stream_type {
+            NewStreamType::Control
+            | NewStreamType::Decoder
+            | NewStreamType::Encoder
+            | NewStreamType::WebTransportStream(_) => self.stream_receive(conn, stream_id),
+            NewStreamType::Push => Ok(ReceiveOutput::NewStream(NewStreamType::Push)),
+            NewStreamType::Http => Ok(ReceiveOutput::NewStream(NewStreamType::Http)),
+            _ => Ok(ReceiveOutput::NoOutput),
         }
     }
 
@@ -513,6 +560,8 @@ impl Http3Connection {
         let send_stream = self
             .send_streams
             .get_mut(&stream_id)
+            .ok_or(Error::InvalidStreamId)?
+            .http_stream()
             .ok_or(Error::InvalidStreamId)?;
         // The following function may return InvalidStreamId from the transport layer if the stream has been cloesd
         // already. It is ok to ignore it here.
@@ -645,16 +694,20 @@ impl Http3Connection {
         send_stream: Box<dyn SendStream>,
         recv_stream: Box<dyn RecvStream>,
     ) {
-        if send_stream.has_data_to_send() {
-            self.streams_have_data_to_send.insert(stream_id);
-        }
-        self.send_streams.insert(stream_id, send_stream);
-        self.recv_streams.insert(stream_id, recv_stream);
+        self.add_send_stream(stream_id, send_stream);
+        self.add_recv_stream(stream_id, recv_stream);
     }
 
     /// Add a new recv stream. This is used for push streams.
     pub fn add_recv_stream(&mut self, stream_id: u64, recv_stream: Box<dyn RecvStream>) {
         self.recv_streams.insert(stream_id, recv_stream);
+    }
+
+    pub fn add_send_stream(&mut self, stream_id: u64, send_stream: Box<dyn SendStream>) {
+        if send_stream.has_data_to_send() {
+            self.streams_have_data_to_send.insert(stream_id);
+        }
+        self.send_streams.insert(stream_id, send_stream);
     }
 
     pub fn queue_control_frame(&mut self, frame: &HFrame) {

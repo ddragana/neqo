@@ -9,7 +9,8 @@ use crate::hframe::HFrame;
 use crate::recv_message::{MessageType, RecvMessage};
 use crate::send_message::SendMessage;
 use crate::server_connection_events::{Http3ServerConnEvent, Http3ServerConnEvents};
-use crate::{Error, Header, ReceiveOutput, Res};
+use crate::wt::WebTransportSession;
+use crate::{Error, Header, Http3StreamType, NewStreamType, ReceiveOutput, Res};
 use neqo_common::{event::Provider, qdebug, qinfo, qtrace};
 use neqo_qpack::QpackSettings;
 use neqo_transport::{AppError, Connection, ConnectionEvent, StreamType};
@@ -49,10 +50,110 @@ impl Http3ServerHandler {
             .send_streams
             .get_mut(&stream_id)
             .ok_or(Error::InvalidStreamId)?
+            .http_stream()
+            .ok_or(Error::InvalidStreamId)?
             .set_message(headers, Some(data))?;
         self.base_handler
             .insert_streams_have_data_to_send(stream_id);
         Ok(())
+    }
+
+    /// Accept a WebTransport Session request
+    pub(crate) fn wt_session_response(
+        &mut self,
+        conn: &mut Connection,
+        stream_id: u64,
+        accept: bool,
+    ) -> Res<()> {
+        let recv_stream = self.base_handler.recv_streams.get_mut(&stream_id);
+        if let Some(r) = &recv_stream {
+            if r.stream_type() != Http3StreamType::WebTransportSession {
+                return Err(Error::InvalidStreamId);
+            }
+        }
+
+        let send_stream = self.base_handler.send_streams.remove(&stream_id);
+        let recv_stream = self.base_handler.recv_streams.remove(&stream_id);
+        match (send_stream, recv_stream) {
+            (None, None) => Err(Error::InvalidStreamId),
+            (None, Some(_)) | (Some(_), None) => {
+                // TODO this needs a better error
+                self.base_handler.stream_reset(
+                    conn,
+                    stream_id,
+                    Error::HttpRequestRejected.code(),
+                )?;
+
+                Err(Error::InvalidStreamId)
+            }
+            (Some(mut s), Some(_)) => {
+                // TODO check that streams are not closed.
+                let headers = if accept {
+                    vec![(":status".into(), "200".into())]
+                } else {
+                    vec![(":status".into(), "400".into())]
+                };
+                s.http_stream()
+                    .ok_or(Error::InvalidStreamId)?
+                    .set_message(&headers, None)?;
+                WebTransportSession::create_session_server(
+                    stream_id,
+                    s,
+                    Box::new(self.events.clone()),
+                    &mut self.base_handler,
+                );
+                self.base_handler
+                    .insert_streams_have_data_to_send(stream_id);
+                Ok(())
+            }
+        }
+    }
+
+    /// Create a WebTraansport stream.
+    pub fn wt_create_stream(
+        &mut self,
+        conn: &mut Connection,
+        stream_id: u64,
+        stream_type: StreamType,
+    ) -> Res<u64> {
+        let wt_session = self
+            .base_handler
+            .send_streams
+            .get_mut(&stream_id)
+            .ok_or(Error::InvalidStreamId)?
+            .get_wt_session()
+            .ok_or(Error::InvalidStreamId)?;
+        match WebTransportSession::create_new_stream_local(wt_session, stream_type, conn)? {
+            (id, s, Some(r)) => {
+                self.base_handler.add_streams(id, s, r);
+                Ok(id)
+            }
+            (id, s, None) => {
+                let _ = self.base_handler.send_streams.insert(id, s);
+                Ok(id)
+            }
+        }
+    }
+
+    // Send data on a WebTransport stream
+    pub fn wt_stream_send_data(
+        &mut self,
+        conn: &mut Connection,
+        stream_id: u64,
+        data: &[u8],
+    ) -> Res<usize> {
+        let wt_stream = self
+            .base_handler
+            .send_streams
+            .get_mut(&stream_id)
+            .ok_or(Error::InvalidStreamId)?
+            .wt_stream()
+            .ok_or(Error::InvalidStreamId)?;
+        let res = wt_stream.send_data(conn, data)?;
+        if res > 0 {
+            self.needs_processing = true;
+        }
+        Ok(res)
     }
 
     /// Reset a request.
@@ -122,28 +223,11 @@ impl Http3ServerHandler {
         while let Some(e) = conn.next_event() {
             qdebug!([self], "check_connection_events - event {:?}.", e);
             match e {
-                ConnectionEvent::NewStream { stream_id } => match stream_id.stream_type() {
-                    StreamType::BiDi => self.base_handler.add_streams(
-                        stream_id.as_u64(),
-                        Box::new(SendMessage::new(
-                            stream_id.as_u64(),
-                            self.base_handler.qpack_encoder.clone(),
-                            Box::new(self.events.clone()),
-                        )),
-                        Box::new(RecvMessage::new(
-                            MessageType::Request,
-                            stream_id.as_u64(),
-                            Rc::clone(&self.base_handler.qpack_decoder),
-                            Box::new(self.events.clone()),
-                            None,
-                        )),
-                    ),
-                    StreamType::UniDi => self
-                        .base_handler
-                        .handle_new_unidi_stream(stream_id.as_u64()),
-                },
+                ConnectionEvent::NewStream { stream_id } => {
+                    self.base_handler.add_new_stream(stream_id.as_u64())
+                }
                 ConnectionEvent::RecvStreamReadable { stream_id } => {
-                    self.handle_stream_readable(conn, stream_id)?
+                    self.handle_stream_readable(conn, stream_id)?;
                 }
                 ConnectionEvent::RecvStreamReset {
                     stream_id,
@@ -182,7 +266,28 @@ impl Http3ServerHandler {
 
     fn handle_stream_readable(&mut self, conn: &mut Connection, stream_id: u64) -> Res<()> {
         match self.base_handler.handle_stream_readable(conn, stream_id)? {
-            ReceiveOutput::PushStream => Err(Error::HttpStreamCreation),
+            ReceiveOutput::NewStream(NewStreamType::Push) => Err(Error::HttpStreamCreation),
+            ReceiveOutput::NewStream(NewStreamType::Http) => {
+                self.base_handler.add_streams(
+                    stream_id,
+                    Box::new(SendMessage::new(
+                        stream_id,
+                        self.base_handler.qpack_encoder.clone(),
+                        Box::new(self.events.clone()),
+                    )),
+                    Box::new(RecvMessage::new(
+                        MessageType::Request,
+                        stream_id,
+                        Rc::clone(&self.base_handler.qpack_decoder),
+                        Box::new(self.events.clone()),
+                        None,
+                        true,
+                    )),
+                );
+                let res = self.base_handler.handle_stream_readable(conn, stream_id)?;
+                assert_eq!(ReceiveOutput::NoOutput, res);
+                Ok(())
+            }
             ReceiveOutput::ControlFrames(control_frames) => {
                 for f in control_frames {
                     match f {
@@ -216,17 +321,27 @@ impl Http3ServerHandler {
         now: Instant,
         stream_id: u64,
         buf: &mut [u8],
+        wt: bool,
     ) -> Res<(usize, bool)> {
         qinfo!([self], "read_data from stream {}.", stream_id);
-        let recv_stream = self
-            .base_handler
-            .recv_streams
-            .get_mut(&stream_id)
-            .ok_or(Error::InvalidStreamId)?
-            .http_stream()
-            .ok_or(Error::InvalidStreamId)?;
-
-        match recv_stream.read_data(conn, buf) {
+        let (res, recv_stream) = if !wt {
+            let recv_stream = self
+                .base_handler
+                .recv_streams
+                .get_mut(&stream_id)
+                .ok_or(Error::InvalidStreamId)?;
+            let http = recv_stream.http_stream().ok_or(Error::InvalidStreamId)?;
+            (http.read_data(conn, buf), recv_stream)
+        } else {
+            let recv_stream = self
+                .base_handler
+                .recv_streams
+                .get_mut(&stream_id)
+                .ok_or(Error::InvalidStreamId)?;
+            let wt = recv_stream.wt_stream().ok_or(Error::InvalidStreamId)?;
+            (wt.read_data(conn, buf), recv_stream)
+        };
+        match res {
             Ok((amount, fin)) => {
                 if recv_stream.done() {
                     self.base_handler.recv_streams.remove(&stream_id);

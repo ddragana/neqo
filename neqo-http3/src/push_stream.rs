@@ -7,7 +7,9 @@
 use crate::client_events::Http3ClientEvents;
 use crate::push_controller::{PushController, RecvPushEvents};
 use crate::recv_message::{MessageType, RecvMessage};
-use crate::{Error, Http3StreamType, HttpRecvStream, ReceiveOutput, RecvStream, Res, ResetType};
+use crate::{
+    Error, Http3StreamType, HttpRecvStream, ReceiveOutput, RecvStream, Res, ResetType, WtRecvStream,
+};
 use neqo_common::{Decoder, IncrementalDecoderUint};
 use neqo_qpack::decoder::QPackDecoder;
 use neqo_transport::{AppError, Connection};
@@ -119,6 +121,7 @@ impl RecvStream for PushStream {
                                                 Rc::clone(&self.push_handler),
                                             )),
                                             None,
+                                            false,
                                         ),
                                     };
                                 } else {
@@ -177,14 +180,13 @@ impl RecvStream for PushStream {
     fn http_stream(&mut self) -> Option<&mut dyn HttpRecvStream> {
         Some(self)
     }
+
+    fn wt_stream(&mut self) -> Option<&mut dyn WtRecvStream> {
+        None
+    }
 }
 
 impl HttpRecvStream for PushStream {
-    fn header_unblocked(&mut self, conn: &mut Connection) -> Res<()> {
-        self.receive(conn)?;
-        Ok(())
-    }
-
     fn read_data(&mut self, conn: &mut Connection, buf: &mut [u8]) -> Res<(usize, bool)> {
         if let PushStreamState::ReadResponse { response, push_id } = &mut self.state {
             let res = response.read_data(conn, buf);
@@ -195,5 +197,10 @@ impl HttpRecvStream for PushStream {
         } else {
             Err(Error::InvalidStreamId)
         }
+    }
+
+    fn header_unblocked(&mut self, conn: &mut Connection) -> Res<()> {
+        self.receive(conn)?;
+        Ok(())
     }
 }

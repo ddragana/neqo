@@ -24,13 +24,12 @@ mod recv_message;
 mod send_message;
 pub mod server;
 mod server_connection_events;
-mod server_events;
+pub mod server_events;
 mod settings;
 mod stream_type_reader;
 mod wt;
+mod wt_stream;
 
-use neqo_qpack::decoder::QPACK_UNI_STREAM_TYPE_DECODER;
-use neqo_qpack::encoder::QPACK_UNI_STREAM_TYPE_ENCODER;
 use neqo_qpack::Error as QpackError;
 pub use neqo_transport::Output;
 use neqo_transport::{AppError, Connection, Error as TransportError};
@@ -45,6 +44,10 @@ pub use neqo_qpack::Header;
 pub use server::Http3Server;
 pub use server_events::{ClientRequestStream, Http3ServerEvent};
 pub use settings::HttpZeroRttChecker;
+
+use std::cell::RefCell;
+use std::rc::Rc;
+use wt::WebTransportSession;
 
 type Res<T> = Result<T, Error>;
 
@@ -271,9 +274,6 @@ impl ::std::fmt::Display for Error {
     }
 }
 
-pub const HTTP3_UNI_STREAM_TYPE_CONTROL: u64 = 0x0;
-pub const HTTP3_UNI_STREAM_TYPE_PUSH: u64 = 0x1;
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Http3StreamType {
     Control,
@@ -282,28 +282,27 @@ pub enum Http3StreamType {
     NewStream,
     Http,
     Push,
-    Unknown,
+    WebTransportSession,
+    WebTransportStream,
 }
 
-impl From<u64> for Http3StreamType {
-    fn from(stream_type: u64) -> Self {
-        match stream_type {
-            HTTP3_UNI_STREAM_TYPE_CONTROL => Self::Control,
-            HTTP3_UNI_STREAM_TYPE_PUSH => Self::Push,
-            QPACK_UNI_STREAM_TYPE_ENCODER => Self::Decoder,
-            QPACK_UNI_STREAM_TYPE_DECODER => Self::Encoder,
-            _ => Self::Unknown,
-        }
-    }
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NewStreamType {
+    Control,
+    Decoder,
+    Encoder,
+    Http,
+    Push,
+    WebTransportStream(u64),
+    Unknown,
 }
 
 #[derive(PartialEq, Debug)]
 pub enum ReceiveOutput {
     NoOutput,
-    PushStream,
     ControlFrames(Vec<HFrame>),
     UnblockedStreams(Vec<u64>),
-    NewStream(Http3StreamType),
+    NewStream(NewStreamType),
 }
 
 pub trait RecvStream: Debug {
@@ -316,6 +315,7 @@ pub trait RecvStream: Debug {
     fn done(&self) -> bool;
     fn stream_type(&self) -> Http3StreamType;
     fn http_stream(&mut self) -> Option<&mut dyn HttpRecvStream>;
+    fn wt_stream(&mut self) -> Option<&mut dyn WtRecvStream>;
 }
 
 pub trait HttpRecvStream: RecvStream {
@@ -331,18 +331,43 @@ pub(crate) trait RecvMessageEvents: Debug {
     fn header_ready(&self, stream_id: u64, headers: Vec<Header>, interim: bool, fin: bool);
     fn data_readable(&self, stream_id: u64);
     fn reset(&self, stream_id: u64, error: AppError, local: bool);
+    fn web_transport_new_session(&self, stream_id: u64, headers: Vec<Header>);
+}
+
+pub trait WtRecvStream: RecvStream {
+    fn read_data(&mut self, conn: &mut Connection, buf: &mut [u8]) -> Res<(usize, bool)>;
+}
+
+pub trait WtSendStream: Debug {
+    fn send_data(&mut self, conn: &mut Connection, buf: &[u8]) -> Res<usize>;
+    fn close(&mut self, conn: &mut Connection) -> Res<()>;
+}
+
+pub trait WtEvents: Debug {
+    fn web_transport_session_negotiated(&self, stream_id: u64, success: bool);
+    fn web_transport_new_stream(&self, stream_id: u64);
+    fn web_transport_data_readable(&self, stream_id: u64);
+    fn web_transport_stream_reset(&self, stream_id: u64, error: AppError);
+    fn web_transport_data_writable(&self, stream_id: u64);
+    fn web_transport_stream_stop_sending(&self, stream_id: u64, error: AppError);
+    fn clone_box(&self) -> Box<dyn WtEvents>;
 }
 
 pub trait SendStream: Debug {
     fn send(&mut self, conn: &mut Connection) -> Res<()>;
     fn has_data_to_send(&self) -> bool;
     fn stream_writable(&self);
-    fn set_message(&mut self, headers: &[Header], data: Option<&[u8]>) -> Res<()>;
-    fn send_body(&mut self, conn: &mut Connection, buf: &[u8]) -> Res<usize>;
     fn done(&self) -> bool;
     fn stop_sending(&mut self, error: AppError);
+    fn http_stream(&mut self) -> Option<&mut dyn HttpSendStream>;
+    fn get_wt_session(&self) -> Option<Rc<RefCell<WebTransportSession>>>;
+    fn wt_stream(&mut self) -> Option<&mut dyn WtSendStream>;
+}
+
+pub trait HttpSendStream: SendStream {
+    fn set_message(&mut self, headers: &[Header], data: Option<&[u8]>) -> Res<()>;
+    fn send_body(&mut self, conn: &mut Connection, buf: &[u8]) -> Res<usize>;
     fn close(&mut self, conn: &mut Connection) -> Res<()>;
-    fn stream_type(&self) -> Http3StreamType;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

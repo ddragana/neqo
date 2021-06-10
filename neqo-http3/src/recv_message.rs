@@ -4,15 +4,15 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use crate::hframe::{HFrame, HFrameReader};
+use crate::hframe::{HFrame, HFrameReader, H3_FRAME_TYPE_HEADERS};
 use crate::push_controller::PushController;
 use crate::qlog;
 use crate::{
     Error, Header, Http3StreamType, HttpRecvStream, ReceiveOutput, RecvMessageEvents, RecvStream,
-    Res, ResetType,
+    Res, ResetType, WtRecvStream,
 };
 
-use neqo_common::{qdebug, qinfo, qtrace};
+use neqo_common::{qdebug, qinfo, qtrace, Decoder, Encoder};
 use neqo_qpack::decoder::QPackDecoder;
 use neqo_transport::{AppError, Connection};
 use std::cell::RefCell;
@@ -27,9 +27,10 @@ const PSEUDO_HEADER_METHOD: u8 = 0x2;
 const PSEUDO_HEADER_SCHEME: u8 = 0x4;
 const PSEUDO_HEADER_AUTHORITY: u8 = 0x8;
 const PSEUDO_HEADER_PATH: u8 = 0x10;
+const PSEUDO_HEADER_PROTOCOL: u8 = 0x20;
 const REGULAR_HEADER: u8 = 0x80;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum MessageType {
     Request,
     Response,
@@ -50,6 +51,10 @@ pub enum MessageType {
  *    ClosePending : waiting for app to pick up data, after that we can delete
  * the TransactionClient.
  *    Closed
+ *    WebTransportRequest: this request is for a WebTransport session. In this
+ *                         state RecvMessage will not be treated as a HTTP
+ *                         stream anymore. It is waiting to be transformed
+ *                         into WebTransport session or to be closed.
  */
 #[derive(Debug)]
 enum RecvMessageState {
@@ -60,6 +65,7 @@ enum RecvMessageState {
     WaitingForFinAfterTrailers { frame_reader: HFrameReader },
     ClosePending, // Close must first be read by application
     Closed,
+    WebTransportRequest,
 }
 
 #[derive(Debug)]
@@ -92,11 +98,16 @@ impl RecvMessage {
         qpack_decoder: Rc<RefCell<QPackDecoder>>,
         conn_events: Box<dyn RecvMessageEvents>,
         push_handler: Option<Rc<RefCell<PushController>>>,
+        header_frame_type_read: bool, // TODO Use stream PEEK for decoding a stream type instread of consuming data.
     ) -> Self {
+        let mut frame_reader = HFrameReader::new();
+        if header_frame_type_read {
+            let mut d = Encoder::default();
+            d.encode_varint(H3_FRAME_TYPE_HEADERS);
+            frame_reader.consume(Decoder::from(&d)).unwrap();
+        }
         Self {
-            state: RecvMessageState::WaitingForResponseHeaders {
-                frame_reader: HFrameReader::new(),
-            },
+            state: RecvMessageState::WaitingForResponseHeaders { frame_reader },
             message_type,
             qpack_decoder,
             conn_events,
@@ -154,12 +165,26 @@ impl RecvMessage {
             return Err(Error::HttpGeneralProtocolStream);
         }
 
-        self.conn_events
-            .header_ready(self.stream_id, headers, interim, fin);
+        let is_web_transport = self.message_type == MessageType::Request
+            && headers
+                .iter()
+                .any(|(name, value)| name == ":method" && value == "CONNECT")
+            && headers
+                .iter()
+                .any(|(name, value)| name == ":protocol" && value == "webtransport");
+        if is_web_transport {
+            self.conn_events
+                .web_transport_new_session(self.stream_id, headers);
+        } else {
+            self.conn_events
+                .header_ready(self.stream_id, headers, interim, fin);
+        }
         if fin {
             self.set_closed();
         } else {
-            self.state = if interim {
+            self.state = if is_web_transport {
+                RecvMessageState::WebTransportRequest
+            } else if interim {
                 RecvMessageState::WaitingForResponseHeaders {
                     frame_reader: HFrameReader::new(),
                 }
@@ -292,7 +317,10 @@ impl RecvMessage {
                         .decode_header_block(header_block, self.stream_id)?;
                     if let Some(headers) = d_headers {
                         self.add_headers(headers, done)?;
-                        if matches!(self.state, RecvMessageState::Closed) {
+                        if matches!(
+                            self.state,
+                            RecvMessageState::Closed | RecvMessageState::WebTransportRequest
+                        ) {
                             break Ok(());
                         }
                     } else {
@@ -308,6 +336,10 @@ impl RecvMessage {
                 }
                 RecvMessageState::ClosePending | RecvMessageState::Closed => {
                     panic!("Stream readable after being closed!");
+                }
+                RecvMessageState::WebTransportRequest => {
+                    // Ignore read event, this request is waiting to be picked up by a new WebTransportSession
+                    break Ok(());
                 }
             };
         }
@@ -361,6 +393,7 @@ impl RecvMessage {
                     ":scheme" => PSEUDO_HEADER_SCHEME,
                     ":authority" => PSEUDO_HEADER_AUTHORITY,
                     ":path" => PSEUDO_HEADER_PATH,
+                    ":protocol" => PSEUDO_HEADER_PROTOCOL,
                     _ => return Err(Error::InvalidHeader),
                 },
             };
@@ -458,11 +491,19 @@ impl RecvStream for RecvMessage {
     }
 
     fn stream_type(&self) -> Http3StreamType {
-        Http3StreamType::Http
+        if !matches!(self.state, RecvMessageState::WebTransportRequest) {
+            Http3StreamType::Http
+        } else {
+            Http3StreamType::WebTransportSession
+        }
     }
 
     fn http_stream(&mut self) -> Option<&mut dyn HttpRecvStream> {
         Some(self)
+    }
+
+    fn wt_stream(&mut self) -> Option<&mut dyn WtRecvStream> {
+        None
     }
 }
 

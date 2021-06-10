@@ -9,7 +9,9 @@
 use crate::connection::Http3State;
 use crate::connection_server::Http3ServerHandler;
 use crate::server_connection_events::Http3ServerConnEvent;
-use crate::server_events::{ClientRequestStream, Http3ServerEvent, Http3ServerEvents};
+use crate::server_events::{
+    ClientRequestStream, Http3ServerEvent, Http3ServerEvents, WtRequestStream, WtStream,
+};
 use crate::settings::HttpZeroRttChecker;
 use crate::Res;
 use neqo_common::{qtrace, Datagram};
@@ -186,6 +188,7 @@ impl Http3Server {
                                 &handler,
                                 now,
                                 &mut self.events,
+                                false,
                             );
                         }
                         Http3ServerConnEvent::StateChange(state) => {
@@ -195,6 +198,50 @@ impl Http3Server {
                                 remove = true;
                             }
                         }
+                        Http3ServerConnEvent::WebTransportNewSession { stream_id, headers } => {
+                            self.events.web_transport_new_session(
+                                WtRequestStream::new(conn.clone(), handler.clone(), stream_id),
+                                headers,
+                            )
+                        }
+                        Http3ServerConnEvent::WebTransportNewStream { stream_id } => {
+                            self.events.web_transport_new_stream(WtStream::new(
+                                conn.clone(),
+                                handler.clone(),
+                                stream_id,
+                            ))
+                        }
+                        Http3ServerConnEvent::WebTransportDataReadable { stream_id } => {
+                            prepare_data(
+                                stream_id,
+                                &mut handler_borrowed,
+                                &mut conn,
+                                &handler,
+                                now,
+                                &mut self.events,
+                                true,
+                            )
+                        }
+                        Http3ServerConnEvent::WebTransportStreamReset { stream_id, error } => {
+                            self.events.web_transport_stream_reset(
+                                WtStream::new(conn.clone(), handler.clone(), stream_id),
+                                error,
+                            )
+                        }
+                        Http3ServerConnEvent::WebTransportDataWritable { stream_id } => {
+                            self.events.web_transport_data_writable(WtStream::new(
+                                conn.clone(),
+                                handler.clone(),
+                                stream_id,
+                            ))
+                        }
+                        Http3ServerConnEvent::WebTransportStreamStopSending {
+                            stream_id,
+                            error,
+                        } => self.events.web_transport_stream_stop_sending(
+                            WtStream::new(conn.clone(), handler.clone(), stream_id),
+                            error,
+                        ),
                     }
                 }
             }
@@ -230,21 +277,36 @@ fn prepare_data(
     handler: &HandlerRef,
     now: Instant,
     events: &mut Http3ServerEvents,
+    wt: bool,
 ) {
     loop {
         let mut data = vec![0; MAX_EVENT_DATA_SIZE];
-        let res =
-            handler_borrowed.read_request_data(&mut conn.borrow_mut(), now, stream_id, &mut data);
+        let res = handler_borrowed.read_request_data(
+            &mut conn.borrow_mut(),
+            now,
+            stream_id,
+            &mut data,
+            wt,
+        );
+        qtrace!("prepare_data read stream_id:{} res={:?}", stream_id, res);
         if let Ok((amount, fin)) = res {
             if amount > 0 {
                 if amount < MAX_EVENT_DATA_SIZE {
                     data.resize(amount, 0);
                 }
-                events.data(
-                    ClientRequestStream::new(conn.clone(), handler.clone(), stream_id),
-                    data,
-                    fin,
-                );
+                if !wt {
+                    events.data(
+                        ClientRequestStream::new(conn.clone(), handler.clone(), stream_id),
+                        data,
+                        fin,
+                    );
+                } else {
+                    events.web_transport_stream_data(
+                        WtStream::new(conn.clone(), handler.clone(), stream_id),
+                        data,
+                        fin,
+                    );
+                }
             }
             if amount < MAX_EVENT_DATA_SIZE || fin {
                 break;
@@ -732,7 +794,7 @@ mod tests {
     }
 
     // Test reading of a slowly streamed frame. bytes are received one by one
-    fn test_incomplet_frame(res: &[u8]) {
+    fn test_incomplete_frame(res: &[u8]) {
         let (mut hconn, mut peer_conn) = connect_and_receive_settings();
 
         // send an incomplete reequest.
@@ -769,19 +831,19 @@ mod tests {
 
     // Incomplete DATA frame
     #[test]
-    fn test_server_incomplet_data_frame() {
-        test_incomplet_frame(&REQUEST_WITH_BODY[..22]);
+    fn test_server_incomplete_data_frame() {
+        test_incomplete_frame(&REQUEST_WITH_BODY[..22]);
     }
 
     // Incomplete HEADERS frame
     #[test]
-    fn test_server_incomplet_headers_frame() {
-        test_incomplet_frame(&REQUEST_WITH_BODY[..10]);
+    fn test_server_incomplete_headers_frame() {
+        test_incomplete_frame(&REQUEST_WITH_BODY[..10]);
     }
 
     #[test]
-    fn test_server_incomplet_unknown_frame() {
-        test_incomplet_frame(&[0x21]);
+    fn test_server_incomplete_unknown_frame() {
+        test_incomplete_frame(&[0x21]);
     }
 
     #[test]
