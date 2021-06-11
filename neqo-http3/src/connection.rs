@@ -282,7 +282,7 @@ impl Http3Connection {
 
         self.recv_streams
             .remove(&stream_id)
-            .map_or(Ok(()), |s| s.stream_reset(app_error, ResetType::Remote))
+            .map_or(Ok(()), |mut s| s.stream_reset(app_error, ResetType::Remote))
     }
 
     pub fn handle_stream_stop_sending(&mut self, stream_id: u64, app_error: AppError) -> Res<()> {
@@ -463,7 +463,7 @@ impl Http3Connection {
             return Err(Error::InvalidStreamId);
         }
         self.send_streams.remove(&stream_id);
-        if let Some(s) = self.recv_streams.remove(&stream_id) {
+        if let Some(mut s) = self.recv_streams.remove(&stream_id) {
             s.stream_reset(error, ResetType::App)?;
         }
 
