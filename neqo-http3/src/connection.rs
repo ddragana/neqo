@@ -427,7 +427,7 @@ impl Http3Connection {
                     stream_id,
                     Box::new(DecoderRecvStream::new(
                         stream_id,
-                        self.qpack_decoder.clone(),
+                        Rc::clone(&self.qpack_decoder),
                     )),
                 );
                 Ok(true)
@@ -439,7 +439,7 @@ impl Http3Connection {
                     stream_id,
                     Box::new(EncoderRecvStream::new(
                         stream_id,
-                        self.qpack_encoder.clone(),
+                        Rc::clone(&self.qpack_encoder),
                     )),
                 );
                 Ok(true)
